@@ -28,11 +28,11 @@ import { ITelemetryService, TelemetryProperties } from '../../telemetry/common/t
 import { TelemetryData } from '../../telemetry/common/telemetryData';
 import { ITokenizerProvider } from '../../tokenizer/node/tokenizer';
 import { ICAPIClientService } from '../common/capiClient';
+import { isAnthropicFamily } from '../common/chatModelCapabilities';
 import { IDomainService } from '../common/domainService';
 import { CustomModel, IChatModelInformation, ModelPolicy, ModelSupportedEndpoint } from '../common/endpointProvider';
 import { createMessagesRequestBody, processResponseFromMessagesEndpoint } from './messagesApi';
 import { createResponsesRequestBody, processResponseFromChatEndpoint } from './responsesApi';
-import { isAnthropicFamily } from '../common/chatModelCapabilities';
 
 /**
  * The default processor for the stream format from CAPI
@@ -262,7 +262,7 @@ export class ChatEndpoint implements IChatEndpoint {
 			return this.customizeMessagesBody(body);
 		} else {
 			const body = createCapiRequestBody(options, this.model, this.getCompletionsCallback());
-			return this.customizeCapiBody(body, options);
+			return this.customizeCapiBody(body);
 		}
 	}
 
@@ -278,13 +278,20 @@ export class ChatEndpoint implements IChatEndpoint {
 		return body;
 	}
 
-	protected customizeCapiBody(body: IEndpointBody, options: ICreateEndpointBodyOptions): IEndpointBody {
-		if (isAnthropicFamily(this) && !options.disableThinking) {
-			const configuredBudget = this._configurationService.getExperimentBasedConfig(ConfigKey.AnthropicThinkingBudget, this._expService);
-			if (configuredBudget && configuredBudget > 0) {
-				const normalizedBudget = configuredBudget < 1024 ? 1024 : configuredBudget;
-				// Cap thinking budget to Anthropic's recommended max (32000), and ensure it's less than max output tokens
-				body.thinking_budget = Math.min(32000, this._maxOutputTokens - 1, normalizedBudget);
+	protected customizeCapiBody(body: IEndpointBody): IEndpointBody {
+		if (isAnthropicFamily(this)) {
+			const messages = body.messages as CAPIChatMessage[] | undefined;
+			const lastMessage = messages?.[messages.length - 1];
+			const isLastMessageUser = lastMessage?.role === OpenAI.ChatRole.User;
+			// When continuing from non user message, disable thinking because we don't have
+			// the original thinking blocks to include in the resumed assistant message.
+			// Anthropic requires thinking blocks to precede tool_use blocks when thinking is enabled.
+			if (isLastMessageUser) {
+				const configuredBudget = this._configurationService.getExperimentBasedConfig(ConfigKey.AnthropicThinkingBudget, this._expService);
+				if (configuredBudget && configuredBudget > 0) {
+					const normalizedBudget = configuredBudget < 1024 ? 1024 : configuredBudget;
+					body.thinking_budget = Math.min(32000, this._maxOutputTokens - 1, normalizedBudget);
+				}
 			}
 		}
 		return body;

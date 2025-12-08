@@ -28,6 +28,7 @@ import { InteractionOutcomeComputer } from '../../inlineChat/node/promptCrafting
 import { ChatVariablesCollection } from '../../prompt/common/chatVariablesCollection';
 import { Conversation, IResultMetadata, ResponseStreamParticipant, TurnStatus } from '../../prompt/common/conversation';
 import { IBuildPromptContext, InternalToolReference, IToolCall, IToolCallRound } from '../../prompt/common/intents';
+import { cancelText, IToolCallIterationIncrease } from '../../prompt/common/specialRequestTypes';
 import { ThinkingDataItem, ToolCallRound } from '../../prompt/common/toolCallRound';
 import { IBuildPromptResult, IResponseProcessor } from '../../prompt/node/intents';
 import { PseudoStopStartResponseProcessor } from '../../prompt/node/pseudoStartStopConversationCallback';
@@ -38,8 +39,6 @@ import { ToolName } from '../../tools/common/toolNames';
 import { ToolCallCancelledError } from '../../tools/common/toolsService';
 import { ReadFileParams } from '../../tools/node/readFileTool';
 import { PauseController } from './pauseController';
-import { cancelText, IToolCallIterationIncrease } from '../../prompt/common/specialRequestTypes';
-import { isAnthropicFamily } from '../../../platform/endpoint/common/chatModelCapabilities';
 
 
 export const enum ToolCallLimitBehavior {
@@ -83,7 +82,7 @@ export interface IToolCallingBuiltPromptEvent {
 	tools: LanguageModelToolInformation[];
 }
 
-export type ToolCallingLoopFetchOptions = Required<Pick<IMakeChatRequestOptions, 'messages' | 'finishedCb' | 'requestOptions' | 'userInitiatedRequest'>> & Pick<IMakeChatRequestOptions, 'disableThinking'>;
+export type ToolCallingLoopFetchOptions = Required<Pick<IMakeChatRequestOptions, 'messages' | 'finishedCb' | 'requestOptions' | 'userInitiatedRequest'>>;
 
 /**
  * This is a base class that can be used to implement a tool calling loop
@@ -434,11 +433,6 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 		let statefulMarker: string | undefined;
 		const toolCalls: IToolCall[] = [];
 		let thinkingItem: ThinkingDataItem | undefined;
-		// When continuing from a tool call error, disable thinking because we don't have
-		// the original thinking blocks to include in the resumed assistant message.
-		// Anthropic requires thinking blocks to precede tool_use blocks when thinking is enabled.
-		const endpoint = await this._endpointProvider.getChatEndpoint(this.options.request);
-		const disableThinking = isContinuation && isAnthropicFamily(endpoint);
 		const fetchResult = await this.fetch({
 			messages: this.applyMessagePostProcessing(buildPromptResult.messages),
 			finishedCb: async (text, index, delta) => {
@@ -469,8 +463,7 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 					type: 'function',
 				})),
 			},
-			userInitiatedRequest: iterationNumber === 0 && !isContinuation && !this.options.request.isSubagent,
-			disableThinking,
+			userInitiatedRequest: iterationNumber === 0 && !isContinuation && !this.options.request.isSubagent
 		}, token);
 
 		fetchStreamSource?.resolve();

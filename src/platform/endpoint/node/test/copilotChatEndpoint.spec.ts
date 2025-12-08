@@ -55,6 +55,11 @@ const createUserMessage = (text: string): Raw.ChatMessage => ({
 	content: [{ type: Raw.ChatCompletionContentPartKind.Text, text }]
 });
 
+const createAssistantMessage = (text: string): Raw.ChatMessage => ({
+	role: Raw.ChatRole.Assistant,
+	content: [{ type: Raw.ChatCompletionContentPartKind.Text, text }]
+});
+
 // Mock implementations
 const createMockServices = () => ({
 	fetcherService: {} as IFetcherService,
@@ -602,7 +607,7 @@ describe('ChatEndpoint - Anthropic Thinking Budget', () => {
 			expect(body.thinking_budget).toBe(1024);
 		});
 
-		it('should not set thinking_budget when disableThinking is true', () => {
+		it('should not set thinking_budget when last message is not a user message', () => {
 			mockServices.configurationService.setConfig(ConfigKey.AnthropicThinkingBudget, 10000);
 			const modelMetadata = createAnthropicModelMetadata('claude-sonnet-4.5', 50000);
 
@@ -621,10 +626,7 @@ describe('ChatEndpoint - Anthropic Thinking Budget', () => {
 				mockServices.logService
 			);
 
-			const options = {
-				...createTestOptions([createUserMessage('Hello')]),
-				disableThinking: true
-			};
+			const options = createTestOptions([createUserMessage('Hello'), createAssistantMessage('Hi there!')]);
 			const body = endpoint.createRequestBody(options);
 
 			expect(body.thinking_budget).toBeUndefined();
