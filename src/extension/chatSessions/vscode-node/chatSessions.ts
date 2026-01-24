@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { IEnvService } from '../../../platform/env/common/envService';
+import { IVSCodeExtensionContext } from '../../../platform/extContext/common/extensionContext';
 import { IGitService } from '../../../platform/git/common/gitService';
 import { IOctoKitService } from '../../../platform/github/common/githubService';
 import { OctoKitService } from '../../../platform/github/common/octoKitServiceImpl';
@@ -16,6 +17,7 @@ import { ServiceCollection } from '../../../util/vs/platform/instantiation/commo
 import { ClaudeToolPermissionService, IClaudeToolPermissionService } from '../../agents/claude/common/claudeToolPermissionService';
 import { ClaudeAgentManager } from '../../agents/claude/node/claudeCodeAgent';
 import { ClaudeCodeModels, IClaudeCodeModels } from '../../agents/claude/node/claudeCodeModels';
+import { claudeCodeOAuthManager } from '../../agents/claude/node/oauth';
 import { ClaudeCodeSdkService, IClaudeCodeSdkService } from '../../agents/claude/node/claudeCodeSdkService';
 import { ClaudeCodeSessionService, IClaudeCodeSessionService } from '../../agents/claude/node/claudeCodeSessionService';
 import { ClaudeSessionStateService, IClaudeSessionStateService } from '../../agents/claude/node/claudeSessionStateService';
@@ -72,8 +74,12 @@ export class ChatSessionsContrib extends Disposable implements IExtensionContrib
 		@ILogService private readonly logService: ILogService,
 		@IOctoKitService private readonly octoKitService: IOctoKitService,
 		@IEnvService private readonly envService: IEnvService,
+		@IVSCodeExtensionContext private readonly extensionContext: IVSCodeExtensionContext,
 	) {
 		super();
+
+		// Initialize Claude Code OAuth manager with extension context for secret storage
+		claudeCodeOAuthManager.initialize(this.extensionContext, (msg) => this.logService.trace(`[ClaudeOAuth] ${msg}`));
 
 		// #region Claude Code Chat Sessions
 		const claudeAgentInstaService = instantiationService.createChild(

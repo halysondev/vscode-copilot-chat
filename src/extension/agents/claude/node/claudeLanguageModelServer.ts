@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import type { Anthropic } from '@anthropic-ai/sdk';
 import { MessageParam } from '@anthropic-ai/sdk/resources';
 import { RequestMetadata, RequestType } from '@vscode/copilot-api';
 import { Raw } from '@vscode/prompt-tsx';
@@ -25,6 +26,10 @@ import { Disposable, toDisposable } from '../../../../util/vs/base/common/lifecy
 import { SSEParser } from '../../../../util/vs/base/common/sseParser';
 import { generateUuid } from '../../../../util/vs/base/common/uuid';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
+import { claudeCodeReasoningConfig } from './claude-code';
+import { IClaudeCodeModels } from './claudeCodeModels';
+import { claudeCodeOAuthManager, generateUserId } from './oauth';
+import { createStreamingMessage, StreamThinkingCompleteChunk, StreamToolCallPartialChunk, ThinkingConfig } from './streaming-client';
 
 export interface IClaudeLanguageModelServerConfig {
 	readonly port: number;
@@ -64,6 +69,7 @@ export class ClaudeLanguageModelServer extends Disposable {
 		@ILogService private readonly logService: ILogService,
 		@IEndpointProvider private readonly endpointProvider: IEndpointProvider,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
+		@IClaudeCodeModels private readonly claudeCodeModels: IClaudeCodeModels,
 	) {
 		super();
 		this.config = {
@@ -114,7 +120,14 @@ export class ClaudeLanguageModelServer extends Disposable {
 
 			await this.handleAuthedMessagesRequest(body, req.headers, res);
 		} catch (error) {
-			this.sendErrorResponse(res, 500, 'api_error', error instanceof Error ? error.message : String(error));
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			if (res.headersSent) {
+				// Headers already sent (streaming started), log error but can't send error response
+				this.error(`Error after headers sent: ${errorMessage}`);
+				res.end();
+			} else {
+				this.sendErrorResponse(res, 500, 'api_error', errorMessage);
+			}
 		}
 		return;
 	}
@@ -141,12 +154,324 @@ export class ClaudeLanguageModelServer extends Disposable {
 	}
 
 	private async handleAuthedMessagesRequest(bodyString: string, headers: http.IncomingHttpHeaders, res: http.ServerResponse): Promise<void> {
+		const requestBody: AnthropicMessagesRequest = JSON.parse(bodyString);
+
+		// Check if OAuth is available - use direct Anthropic API if authenticated
+		const accessToken = await claudeCodeOAuthManager.getAccessToken();
+
+		if (accessToken) {
+			this.trace('Using OAuth authentication for direct Anthropic API call');
+			await this.handleOAuthRequest(requestBody, accessToken, res);
+		} else {
+			// Fall back to existing VS Code endpoint forwarding
+			this.trace('Using VS Code endpoint forwarding (no OAuth credentials)');
+			await this.handleEndpointRequest(requestBody, headers, res);
+		}
+	}
+
+	/**
+	 * Handle request via direct OAuth-authenticated Anthropic API call
+	 */
+	private async handleOAuthRequest(
+		requestBody: AnthropicMessagesRequest,
+		accessToken: string,
+		res: http.ServerResponse
+	): Promise<void> {
+		// Set up streaming response
+		res.writeHead(200, {
+			'Content-Type': 'text/event-stream',
+			'Cache-Control': 'no-cache',
+			'Connection': 'keep-alive',
+		});
+
+		// Create abort controller for request cancellation
+		const abortController = new AbortController();
+		res.on('close', () => {
+			abortController.abort();
+		});
+
+		try {
+			await this.streamWithOAuthToken(accessToken, requestBody, res, abortController.signal);
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+
+			// Check if it's an abort (client closed connection) - this is normal, just end quietly
+			if (abortController.signal.aborted || errorMessage.includes('aborted') || errorMessage.includes('AbortError')) {
+				this.trace(`OAuth request aborted (client closed connection)`);
+				if (!res.writableEnded) {
+					res.end();
+				}
+				return;
+			}
+
+			// Check if it's an auth error - try to refresh and retry
+			if (errorMessage.includes('401') || errorMessage.includes('authentication') || errorMessage.includes('unauthorized')) {
+				this.info('OAuth token may be expired, attempting refresh...');
+				try {
+					const newToken = await claudeCodeOAuthManager.forceRefreshAccessToken();
+					if (newToken) {
+						this.info('Token refreshed, retrying request...');
+						await this.streamWithOAuthToken(newToken, requestBody, res, abortController.signal);
+						if (!res.writableEnded) {
+							res.end();
+						}
+						return;
+					}
+				} catch (refreshError) {
+					this.error(`Token refresh failed: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+				}
+			}
+
+			// Send error as SSE event since headers are already sent
+			this.error(`OAuth streaming error: ${errorMessage}`);
+			if (!res.writableEnded) {
+				res.write(formatSSE('error', {
+					type: 'error',
+					error: { type: 'api_error', message: errorMessage },
+				}));
+				res.end();
+			}
+			return;
+		}
+
+		if (!res.writableEnded) {
+			res.end();
+		}
+	}
+
+	/**
+	 * Stream a response using the OAuth token and streaming client
+	 */
+	private async streamWithOAuthToken(
+		accessToken: string,
+		requestBody: AnthropicMessagesRequest,
+		res: http.ServerResponse,
+		signal: AbortSignal
+	): Promise<void> {
+		// Extract system prompt from request
+		const systemPrompt = extractSystemPrompt(requestBody);
+		this.trace(`[OAuth] System prompt length: ${systemPrompt.length}`);
+
+		// Build thinking config based on model's reasoning effort setting
+		let thinking: ThinkingConfig | undefined;
+		if (requestBody.thinking) {
+			const thinkingInput = requestBody.thinking as { type?: string; budget_tokens?: number };
+			if (thinkingInput.type === 'enabled' && thinkingInput.budget_tokens) {
+				thinking = { type: 'enabled', budget_tokens: thinkingInput.budget_tokens };
+			} else if (thinkingInput.type === 'disabled') {
+				thinking = { type: 'disabled' };
+			}
+		} else {
+			// Get user's selected reasoning effort from service
+			const reasoningEffort = this.claudeCodeModels.getReasoningEffort();
+			if (reasoningEffort === 'disable') {
+				thinking = undefined; // No thinking
+			} else {
+				const reasoningConfig = claudeCodeReasoningConfig[reasoningEffort];
+				thinking = { type: 'enabled', budget_tokens: reasoningConfig.budgetTokens };
+			}
+		}
+		this.info(`[OAuth] Model: ${requestBody.model}, Thinking config: ${JSON.stringify(thinking)}`);
+
+		// Generate user_id for Claude Code API
+		const email = await claudeCodeOAuthManager.getEmail();
+		const userId = generateUserId(email ?? undefined);
+		this.trace(`[OAuth] User ID: ${userId}, Email: ${email ?? 'none'}`);
+
+		// Log request details
+		this.info(`[OAuth] Request model: ${requestBody.model}`);
+		this.info(`[OAuth] Request messages count: ${requestBody.messages?.length ?? 0}`);
+		this.info(`[OAuth] Request tools count: ${requestBody.tools?.length ?? 0}`);
+		this.info(`[OAuth] Request max_tokens: ${requestBody.max_tokens}`);
+
+		// Track content block state for proper SSE formatting
+		let currentBlockIndex = 0;
+		let messageStartSent = false;
+		// Track which block types have had their content_block_start sent
+		const blockStarted: Map<number, string> = new Map(); // index -> block type
+
+		// Use streaming client to make direct API call
+		this.info('[OAuth] Starting streaming request to Anthropic API...');
+		const stream = createStreamingMessage({
+			accessToken,
+			model: requestBody.model,
+			systemPrompt,
+			messages: requestBody.messages as Anthropic.Messages.MessageParam[],
+			maxTokens: requestBody.max_tokens,
+			thinking,
+			tools: requestBody.tools as Anthropic.Messages.Tool[] | undefined,
+			toolChoice: requestBody.tool_choice as Anthropic.Messages.ToolChoice | undefined,
+			metadata: { user_id: userId },
+			signal,
+		});
+
+		// Convert StreamChunks to Anthropic SSE events and write to response
+		// Track current tool_use block index for argument deltas
+		let currentToolUseIndex: number | null = null;
+		// Track if we have any tool_use blocks to determine stop_reason
+		let hasToolUse = false;
+
+		for await (const chunk of stream) {
+			this.trace(`[OAuth] Received chunk: ${chunk.type}${chunk.type === 'tool_call_partial' ? ` (id=${(chunk as StreamToolCallPartialChunk).id}, name=${(chunk as StreamToolCallPartialChunk).name})` : ''}`);
+
+			// Send message_start on first chunk
+			if (!messageStartSent) {
+				const messageStart = formatSSE('message_start', {
+					type: 'message_start',
+					message: {
+						id: `msg_${generateUuid()}`,
+						type: 'message',
+						role: 'assistant',
+						content: [],
+						model: requestBody.model,
+						stop_reason: null,
+						stop_sequence: null,
+						usage: { input_tokens: 0, output_tokens: 0 },
+					},
+				});
+				res.write(messageStart);
+				messageStartSent = true;
+			}
+
+			// Handle content_block_start for new blocks
+			if (chunk.type === 'text') {
+				// Start text block if not already started
+				if (!blockStarted.has(currentBlockIndex) || blockStarted.get(currentBlockIndex) !== 'text') {
+					// Close previous block if different type
+					if (blockStarted.has(currentBlockIndex)) {
+						res.write(formatSSE('content_block_stop', {
+							type: 'content_block_stop',
+							index: currentBlockIndex,
+						}));
+						currentBlockIndex++;
+					}
+					res.write(formatSSE('content_block_start', {
+						type: 'content_block_start',
+						index: currentBlockIndex,
+						content_block: { type: 'text', text: '' },
+					}));
+					blockStarted.set(currentBlockIndex, 'text');
+				}
+				// Send text delta
+				res.write(formatSSE('content_block_delta', {
+					type: 'content_block_delta',
+					index: currentBlockIndex,
+					delta: { type: 'text_delta', text: chunk.text },
+				}));
+			} else if (chunk.type === 'reasoning') {
+				// Start thinking block if not already started
+				if (!blockStarted.has(currentBlockIndex) || blockStarted.get(currentBlockIndex) !== 'thinking') {
+					// Close previous block if different type
+					if (blockStarted.has(currentBlockIndex)) {
+						res.write(formatSSE('content_block_stop', {
+							type: 'content_block_stop',
+							index: currentBlockIndex,
+						}));
+						currentBlockIndex++;
+					}
+					res.write(formatSSE('content_block_start', {
+						type: 'content_block_start',
+						index: currentBlockIndex,
+						content_block: { type: 'thinking', thinking: '' },
+					}));
+					blockStarted.set(currentBlockIndex, 'thinking');
+				}
+				// Send thinking delta
+				res.write(formatSSE('content_block_delta', {
+					type: 'content_block_delta',
+					index: currentBlockIndex,
+					delta: { type: 'thinking_delta', thinking: chunk.text },
+				}));
+			} else if (chunk.type === 'thinking_complete') {
+				// Emit signature_delta before closing the thinking block
+				// This is critical for interleaved thinking - the SDK needs the signature
+				// to pass thinking blocks back to the API in follow-up requests
+				const thinkingChunk = chunk as StreamThinkingCompleteChunk;
+				if (thinkingChunk.signature) {
+					res.write(formatSSE('content_block_delta', {
+						type: 'content_block_delta',
+						index: currentBlockIndex,
+						delta: { type: 'signature_delta', signature: thinkingChunk.signature },
+					}));
+				}
+				// Close the thinking block
+				res.write(formatSSE('content_block_stop', {
+					type: 'content_block_stop',
+					index: currentBlockIndex,
+				}));
+				currentBlockIndex++;
+				blockStarted.delete(currentBlockIndex - 1); // Clear the old block
+			} else if (chunk.type === 'tool_call_partial') {
+				const toolChunk = chunk as StreamToolCallPartialChunk;
+				if (toolChunk.id && toolChunk.name) {
+					// New tool_use block starting
+					hasToolUse = true;
+					// Close previous block if any
+					if (blockStarted.has(currentBlockIndex)) {
+						res.write(formatSSE('content_block_stop', {
+							type: 'content_block_stop',
+							index: currentBlockIndex,
+						}));
+						currentBlockIndex++;
+					}
+					// Start new tool_use block
+					res.write(formatSSE('content_block_start', {
+						type: 'content_block_start',
+						index: currentBlockIndex,
+						content_block: {
+							type: 'tool_use',
+							id: toolChunk.id,
+							name: toolChunk.name,
+							input: {},
+						},
+					}));
+					blockStarted.set(currentBlockIndex, 'tool_use');
+					currentToolUseIndex = currentBlockIndex;
+				} else if (toolChunk.arguments && currentToolUseIndex !== null) {
+					// Tool arguments delta - use the tool_use block index
+					res.write(formatSSE('content_block_delta', {
+						type: 'content_block_delta',
+						index: currentToolUseIndex,
+						delta: { type: 'input_json_delta', partial_json: toolChunk.arguments },
+					}));
+				}
+			} else if (chunk.type === 'usage') {
+				// Send message_delta with usage and stop_reason
+				const stopReason = hasToolUse ? 'tool_use' : 'end_turn';
+				res.write(formatSSE('message_delta', {
+					type: 'message_delta',
+					delta: { stop_reason: stopReason, stop_sequence: null },
+					usage: { output_tokens: chunk.outputTokens },
+				}));
+			} else if (chunk.type === 'error') {
+				// Send error event
+				res.write(formatSSE('error', {
+					type: 'error',
+					error: { type: 'api_error', message: chunk.error },
+				}));
+			}
+		}
+
+		// Close any open blocks
+		if (blockStarted.has(currentBlockIndex)) {
+			res.write(formatSSE('content_block_stop', {
+				type: 'content_block_stop',
+				index: currentBlockIndex,
+			}));
+		}
+
+		// Send message_stop
+		res.write(formatSSE('message_stop', { type: 'message_stop' }));
+	}
+
+	/**
+	 * Handle request via VS Code endpoint forwarding (existing behavior)
+	 */
+	private async handleEndpointRequest(requestBody: AnthropicMessagesRequest, headers: http.IncomingHttpHeaders, res: http.ServerResponse): Promise<void> {
 		// Create cancellation token for the request
 		const tokenSource = new CancellationTokenSource();
 
 		try {
-			const requestBody: AnthropicMessagesRequest = JSON.parse(bodyString);
-
 			// Determine if this is a user-initiated message
 			const lastMessage = requestBody.messages?.at(-1);
 			const isUserInitiatedMessage = lastMessage?.role === 'user';
@@ -218,45 +543,30 @@ export class ClaudeLanguageModelServer extends Disposable {
 			requestComplete = true;
 
 			res.end();
-		} catch (error) {
-			this.sendErrorResponse(res, 500, 'api_error', error instanceof Error ? error.message : String(error));
 		} finally {
 			tokenSource.dispose();
 		}
 	}
 
 	private selectEndpoint(endpoints: readonly IChatEndpoint[], requestedModel?: string): IChatEndpoint | undefined {
-		if (requestedModel) {
-			// Handle Claude model name mapping
-			// e.g. claude-sonnet-4-20250514 -> claude-sonnet-4.20250514
-			let mappedModel = requestedModel;
-			if (requestedModel.startsWith('claude-')) {
-				const parts = requestedModel.split('-');
-				if (parts.length >= 4) {
-					// claude-sonnet-4-20250514 -> ['claude', 'sonnet', '4', '20250514']
-					const [claude, model, major, minor] = parts;
-					mappedModel = `${claude}-${model}-${major}.${minor}`;
-				}
-			}
-
-			// Try to find exact match first by family or model
-			let selectedEndpoint = endpoints.find(e => e.family === mappedModel || e.model === mappedModel);
-
-			// If not found, try partial match for common Claude model patterns
-			if (!selectedEndpoint && requestedModel.startsWith('claude-sonnet-4')) {
-				selectedEndpoint = endpoints.find(e => e.model.includes('claude-sonnet-4')) ?? endpoints.find(e => e.model.includes('claude'));
-			} else if (!selectedEndpoint && requestedModel.startsWith('claude-3-5-haiku')) {
-				selectedEndpoint = endpoints.find(e => e.model.includes('gpt-4o-mini')) ?? endpoints.find(e => e.model.includes('mini'));
-			} else if (!selectedEndpoint && requestedModel.startsWith('claude-')) {
-				// Generic Claude fallback
-				selectedEndpoint = endpoints.find(e => e.model.includes('claude') || e.family?.includes('claude'));
-			}
-
-			return selectedEndpoint;
+		if (!requestedModel) {
+			return undefined;
 		}
 
-		// Use first available model if no criteria specified
-		return endpoints[0];
+		// Handle Claude model name mapping
+		// e.g. claude-sonnet-4-20250514 -> claude-sonnet-4.20250514
+		let mappedModel = requestedModel;
+		if (requestedModel.startsWith('claude-')) {
+			const parts = requestedModel.split('-');
+			if (parts.length >= 4) {
+				// claude-sonnet-4-20250514 -> ['claude', 'sonnet', '4', '20250514']
+				const [claude, model, major, minor] = parts;
+				mappedModel = `${claude}-${model}-${major}.${minor}`;
+			}
+		}
+
+		// Only exact match by family or model - no fallbacks
+		return endpoints.find(e => e.family === mappedModel || e.model === mappedModel);
 	}
 
 	private sendErrorResponse(
@@ -326,6 +636,26 @@ export class ClaudeLanguageModelServer extends Disposable {
 		const messageWithClassName = `[ClaudeLanguageModelServer] ${message}`;
 		this.logService.trace(messageWithClassName);
 	}
+}
+
+/**
+ * Extracts the system prompt from an Anthropic request.
+ */
+function extractSystemPrompt(request: AnthropicMessagesRequest): string {
+	if (!request.system) {
+		return '';
+	}
+	if (typeof request.system === 'string') {
+		return request.system;
+	}
+	return request.system.map(block => block.text).join('\n');
+}
+
+/**
+ * Formats data as an SSE event string.
+ */
+function formatSSE(event: string, data: unknown): string {
+	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
 /**
