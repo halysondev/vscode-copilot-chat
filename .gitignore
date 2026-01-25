@@ -39,3 +39,4 @@ test/aml/out
 
 claude.MD
 .claude/
+settings.local.json
