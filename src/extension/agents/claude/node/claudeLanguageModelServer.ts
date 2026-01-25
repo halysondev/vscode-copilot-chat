@@ -163,9 +163,14 @@ export class ClaudeLanguageModelServer extends Disposable {
 			this.trace('Using OAuth authentication for direct Anthropic API call');
 			await this.handleOAuthRequest(requestBody, accessToken, res);
 		} else {
-			// Fall back to existing VS Code endpoint forwarding
-			this.trace('Using VS Code endpoint forwarding (no OAuth credentials)');
-			await this.handleEndpointRequest(requestBody, headers, res);
+			// No OAuth token available - return error instead of falling back to Copilot API
+			this.error('No Claude Code OAuth credentials available. Please sign in to Claude Code.');
+			this.sendErrorResponse(
+				res,
+				401,
+				'authentication_error',
+				'Claude Code OAuth not configured. Please sign in using the "Claude Code: Sign In" command.'
+			);
 		}
 	}
 
@@ -466,7 +471,9 @@ export class ClaudeLanguageModelServer extends Disposable {
 
 	/**
 	 * Handle request via VS Code endpoint forwarding (existing behavior)
+	 * @deprecated Kept for potential future use. Not called to avoid consuming GitHub/Copilot API tokens.
 	 */
+	// @ts-expect-error - Intentionally unused, kept for potential future use
 	private async handleEndpointRequest(requestBody: AnthropicMessagesRequest, headers: http.IncomingHttpHeaders, res: http.ServerResponse): Promise<void> {
 		// Create cancellation token for the request
 		const tokenSource = new CancellationTokenSource();
