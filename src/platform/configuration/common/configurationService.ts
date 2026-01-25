@@ -661,7 +661,7 @@ export namespace ConfigKey {
 		export const GitHistoryRelatedFilesUsingEmbeddings = defineAndMigrateSetting('chat.advanced.suggestRelatedFilesFromGitHistory.useEmbeddings', 'chat.suggestRelatedFilesFromGitHistory.useEmbeddings', false);
 		export const CLICustomAgentsEnabled = defineAndMigrateSetting<boolean | undefined>('chat.advanced.cli.customAgents.enabled', 'chat.cli.customAgents.enabled', true);
 		export const CLIMCPServerEnabled = defineAndMigrateSetting<boolean | undefined>('chat.advanced.cli.mcp.enabled', 'chat.cli.mcp.enabled', true);
-		export const EnableClaudeCodeAgent = defineAndMigrateSetting<boolean | string | undefined>('chat.advanced.claudeCode.enabled', 'chat.claudeCode.enabled', false);
+		export const EnableClaudeCodeAgent = defineAndMigrateSetting<boolean | string | undefined>('chat.advanced.claudeCode.enabled', 'chat.claudeCode.enabled', true);
 		export const RequestLoggerMaxEntries = defineAndMigrateSetting<number>('chat.advanced.debug.requestLogger.maxEntries', 'chat.debug.requestLogger.maxEntries', 100);
 
 		// Experiment-based settings
