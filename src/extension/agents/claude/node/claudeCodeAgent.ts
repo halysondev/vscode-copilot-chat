@@ -29,6 +29,7 @@ import { IClaudeCodeSdkService } from './claudeCodeSdkService';
 import { ClaudeLanguageModelServer, IClaudeLanguageModelServerConfig } from './claudeLanguageModelServer';
 import { ClaudeSettingsChangeTracker } from './claudeSettingsChangeTracker';
 import { buildHooksFromRegistry } from './hooks/index';
+import { claudeCodeOAuthManager } from './oauth';
 
 // Manages Claude Code agent interactions and language model server lifecycle
 export class ClaudeAgentManager extends Disposable {
@@ -49,6 +50,15 @@ export class ClaudeAgentManager extends Disposable {
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 	) {
 		super();
+	}
+
+	/**
+	 * Initializes the OAuth manager with the extension context.
+	 * This should be called during extension activation.
+	 */
+	public initializeOAuth(context: vscode.ExtensionContext): void {
+		claudeCodeOAuthManager.initialize(context, (msg) => this.logService.trace(`[ClaudeOAuth] ${msg}`));
+		this.logService.trace('[ClaudeAgentManager] OAuth manager initialized');
 	}
 
 	public async handleRequest(claudeSessionId: string | undefined, request: vscode.ChatRequest, _context: vscode.ChatContext, stream: vscode.ChatResponseStream, token: vscode.CancellationToken, modelId?: string, permissionMode?: PermissionMode): Promise<vscode.ChatResult & { claudeSessionId?: string }> {
@@ -514,13 +524,16 @@ export class ClaudeCodeSession extends Disposable {
 	private async _processMessages(): Promise<void> {
 		try {
 			const unprocessedToolCalls = new Map<string, Anthropic.ToolUseBlock>();
+			this.logService.info('[ClaudeCodeSession] Starting to process messages from SDK');
 			for await (const message of this._queryGenerator!) {
 				// Check if current request was cancelled
 				if (this._currentRequest?.token.isCancellationRequested) {
 					throw new Error('Request was cancelled');
 				}
 
-				this.logService.trace(`claude-agent-sdk Message: ${JSON.stringify(message, null, 2)}`);
+				// Log message type and key details
+				this.logService.info(`[ClaudeCodeSession] Received message type: ${message.type}`);
+				this.logService.trace(`[ClaudeCodeSession] Full message: ${JSON.stringify(message, null, 2)}`);
 				if (message.session_id) {
 					this.sessionId = message.session_id;
 				}
@@ -530,6 +543,7 @@ export class ClaudeCodeSession extends Disposable {
 				} else if (message.type === 'user') {
 					this.handleUserMessage(message, this._currentRequest!.stream, unprocessedToolCalls, this._currentRequest!.toolInvocationToken, this._currentRequest!.token);
 				} else if (message.type === 'result') {
+					this.logService.info(`[ClaudeCodeSession] Processing result message with subtype: ${(message as SDKResultMessage).subtype}`);
 					this.handleResultMessage(message, this._currentRequest!.stream);
 					// Resolve and remove the completed request
 					if (this._promptQueue.length > 0) {
@@ -540,8 +554,11 @@ export class ClaudeCodeSession extends Disposable {
 				}
 			}
 			// Generator ended normally - clean up so next invoke starts fresh
+			this.logService.info('[ClaudeCodeSession] Query generator ended');
 			this._cleanup(new Error('Session ended unexpectedly'));
 		} catch (error) {
+			this.logService.error(`[ClaudeCodeSession] Error in _processMessages: ${error instanceof Error ? error.message : String(error)}`);
+			this.logService.error(`[ClaudeCodeSession] Stack: ${error instanceof Error ? error.stack : 'no stack'}`);
 			this._cleanup(error as Error);
 		}
 	}
@@ -683,9 +700,14 @@ export class ClaudeCodeSession extends Disposable {
 		message: SDKResultMessage,
 		stream: vscode.ChatResponseStream
 	): void {
+		// Log the full result message for debugging
+		this.logService.info(`[ClaudeCodeSession] Result message: ${JSON.stringify(message)}`);
+
 		if (message.subtype === 'error_max_turns') {
 			stream.progress(l10n.t('Maximum turns reached ({0})', message.num_turns));
 		} else if (message.subtype === 'error_during_execution') {
+			// Log the error details
+			this.logService.error(`[ClaudeCodeSession] Error during execution. Message: ${JSON.stringify(message)}`);
 			throw new KnownClaudeError(l10n.t('Error during execution'));
 		}
 	}

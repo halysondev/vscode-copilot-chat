@@ -20,6 +20,7 @@ import { ClaudeSessionUri } from './claudeChatSessionItemProvider';
 
 const MODELS_OPTION_ID = 'model';
 const PERMISSION_MODE_OPTION_ID = 'permissionMode';
+const REASONING_EFFORT_OPTION_ID = 'reasoningEffort';
 
 interface ToolContext {
 	unprocessedToolCalls: Map<string, Anthropic.ToolUseBlock>;
@@ -115,6 +116,16 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 			permissionModeItems.push({ id: 'bypassPermissions', name: l10n.t('Bypass all permissions') });
 		}
 
+		// Get reasoning effort options
+		const reasoningEffortOptions = this.claudeCodeModels.getReasoningEffortOptions();
+		const currentReasoningEffort = this.claudeCodeModels.getReasoningEffort();
+		const reasoningEffortItems: vscode.ChatSessionProviderOptionItem[] = reasoningEffortOptions.map(opt => ({
+			id: opt.id,
+			name: opt.name,
+			description: opt.description,
+			default: opt.id === currentReasoningEffort,
+		}));
+
 		return {
 			optionGroups: [
 				{
@@ -128,6 +139,12 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 					name: l10n.t('Model'),
 					description: l10n.t('Pick Model'),
 					items: modelItems,
+				},
+				{
+					id: REASONING_EFFORT_OPTION_ID,
+					name: l10n.t('Thinking'),
+					description: l10n.t('Pick Reasoning Effort'),
+					items: reasoningEffortItems,
 				}
 			]
 		};
@@ -145,6 +162,9 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 				// Update last known first so the event listener won't fire back to UI
 				this._updateLastKnown(sessionId, { permissionMode: update.value as PermissionMode });
 				this.sessionStateService.setPermissionModeForSession(sessionId, update.value as PermissionMode);
+			} else if (update.optionId === REASONING_EFFORT_OPTION_ID && update.value) {
+				// Reasoning effort is a global setting, not per-session
+				void this.claudeCodeModels.setReasoningEffort(update.value as 'low' | 'medium' | 'high');
 			}
 		}
 	}
@@ -166,6 +186,7 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 			options[MODELS_OPTION_ID] = model;
 		}
 		options[PERMISSION_MODE_OPTION_ID] = permissionMode;
+		options[REASONING_EFFORT_OPTION_ID] = this.claudeCodeModels.getReasoningEffort();
 
 		return {
 			history,

@@ -7,6 +7,7 @@
 // Add new command imports here as they are created
 
 import './agentsCommand';
+import './authCommand';
 import './hooksCommand';
 import './memoryCommand';
 

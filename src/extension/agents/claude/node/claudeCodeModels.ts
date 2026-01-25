@@ -8,8 +8,11 @@ import { IVSCodeExtensionContext } from '../../../../platform/extContext/common/
 import { ILogService } from '../../../../platform/log/common/logService';
 import { createServiceIdentifier } from '../../../../util/common/services';
 import { Lazy } from '../../../../util/vs/base/common/lazy';
+import { claudeCodeModels, claudeCodeReasoningConfig, ClaudeCodeModelId, ClaudeCodeReasoningLevel } from './claude-code';
+import { claudeCodeOAuthManager } from './oauth';
 
 const CLAUDE_CODE_MODEL_MEMENTO_KEY = 'github.copilot.claudeCode.sessionModel';
+const CLAUDE_CODE_REASONING_EFFORT_KEY = 'github.copilot.claudeCode.reasoningEffort';
 
 export interface ClaudeCodeModelInfo {
 	id: string;
@@ -23,6 +26,9 @@ export interface IClaudeCodeModels {
 	getDefaultModel(): Promise<string | undefined>;
 	setDefaultModel(modelId: string | undefined): Promise<void>;
 	getModels(): Promise<ClaudeCodeModelInfo[]>;
+	getReasoningEffort(): ClaudeCodeReasoningLevel;
+	setReasoningEffort(level: ClaudeCodeReasoningLevel): Promise<void>;
+	getReasoningEffortOptions(): { id: ClaudeCodeReasoningLevel; name: string; description: string }[];
 }
 
 export const IClaudeCodeModels = createServiceIdentifier<IClaudeCodeModels>('IClaudeCodeModels');
@@ -70,9 +76,53 @@ export class ClaudeCodeModels implements IClaudeCodeModels {
 		await this.extensionContext.globalState.update(CLAUDE_CODE_MODEL_MEMENTO_KEY, modelId);
 	}
 
+	public getReasoningEffort(): ClaudeCodeReasoningLevel {
+		const stored = this.extensionContext.globalState.get<string>(CLAUDE_CODE_REASONING_EFFORT_KEY);
+		if (stored === 'disable' || (stored && stored in claudeCodeReasoningConfig)) {
+			return stored as ClaudeCodeReasoningLevel;
+		}
+		return 'high'; // Default to high
+	}
+
+	public async setReasoningEffort(level: ClaudeCodeReasoningLevel): Promise<void> {
+		await this.extensionContext.globalState.update(CLAUDE_CODE_REASONING_EFFORT_KEY, level);
+	}
+
+	public getReasoningEffortOptions(): { id: ClaudeCodeReasoningLevel; name: string; description: string }[] {
+		return [
+			{ id: 'disable', name: 'Disable', description: 'No thinking' },
+			{ id: 'low', name: 'Low', description: `${claudeCodeReasoningConfig.low.budgetTokens.toLocaleString()} tokens` },
+			{ id: 'medium', name: 'Medium', description: `${claudeCodeReasoningConfig.medium.budgetTokens.toLocaleString()} tokens` },
+			{ id: 'high', name: 'High', description: `${claudeCodeReasoningConfig.high.budgetTokens.toLocaleString()} tokens` },
+		];
+	}
+
 	public async getModels(): Promise<ClaudeCodeModelInfo[]> {
-		// Cache the result to avoid multiple queries
+		// Check if OAuth is authenticated - if so, return Claude Code subscription models
+		const isOAuthAuthenticated = await claudeCodeOAuthManager.isAuthenticated();
+		if (isOAuthAuthenticated) {
+			this.logService.trace('[ClaudeCodeModels] OAuth authenticated, returning Claude Code subscription models');
+			return this._getClaudeCodeSubscriptionModels();
+		}
+
+		// Fall back to endpoint-provided models
 		return this._availableModels.value;
+	}
+
+	/**
+	 * Returns the Claude Code subscription models (Haiku, Sonnet, Opus).
+	 * These are the models available with a Claude Code subscription via OAuth.
+	 */
+	private _getClaudeCodeSubscriptionModels(): ClaudeCodeModelInfo[] {
+		const modelIds = Object.keys(claudeCodeModels) as ClaudeCodeModelId[];
+		return modelIds.map(id => {
+			const model = claudeCodeModels[id];
+			return {
+				id,
+				name: model.description,
+				multiplier: undefined, // Claude Code subscription has flat pricing
+			};
+		});
 	}
 
 	private async _getAvailableModels(): Promise<ClaudeCodeModelInfo[]> {
