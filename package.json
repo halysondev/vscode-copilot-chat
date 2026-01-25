@@ -4055,7 +4055,7 @@
 							"boolean",
 							"string"
 						],
-						"default": false,
+						"default": true,
 						"markdownDescription": "%github.copilot.config.claudeCode.enabled%",
 						"tags": [
 							"advanced",
