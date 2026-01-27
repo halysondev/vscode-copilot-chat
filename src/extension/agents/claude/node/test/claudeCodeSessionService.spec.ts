@@ -22,7 +22,9 @@ import { createExtensionUnitTestingServices } from '../../../../test/node/servic
 import { ClaudeCodeSessionService } from '../claudeCodeSessionService';
 
 function computeFolderSlug(folderUri: URI): string {
-	return folderUri.path.replace(/\//g, '-');
+	return folderUri.path
+		.replace(/^\/([a-z]):/i, (_, driveLetter) => driveLetter.toUpperCase() + '-')
+		.replace(/[\/ .]/g, '-');
 }
 
 describe('ClaudeCodeSessionService', () => {
@@ -52,6 +54,50 @@ describe('ClaudeCodeSessionService', () => {
 		const nativeEnvService = accessor.get(INativeEnvService);
 		dirUri = URI.joinPath(nativeEnvService.userHome, '.claude', 'projects', slug);
 		service = instaService.createInstance(ClaudeCodeSessionService);
+	});
+
+	it('handles large session files (>5MB) correctly', async () => {
+		// Create a large session file by repeating a valid message entry
+		const fileName = 'large-session.jsonl';
+		const timestamp = new Date().toISOString();
+
+		// Create a base message entry
+		const baseMessage = JSON.stringify({
+			parentUuid: null,
+			sessionId: 'large-session',
+			type: 'user',
+			message: { role: 'user', content: 'x'.repeat(1000) }, // 1KB per message
+			uuid: 'uuid-1',
+			timestamp
+		});
+
+		// Repeat the message 6000 times to create ~6MB file
+		const lines: string[] = [];
+		for (let i = 0; i < 6000; i++) {
+			const message = JSON.parse(baseMessage);
+			message.uuid = `uuid-${i}`;
+			if (i > 0) {
+				message.parentUuid = `uuid-${i - 1}`;
+			}
+			lines.push(JSON.stringify(message));
+		}
+
+		const largeFileContents = lines.join('\n');
+		const fileSizeInMB = Math.round(largeFileContents.length / (1024 * 1024));
+
+		// Verify the file is actually large enough (>5MB)
+		expect(fileSizeInMB).toBeGreaterThan(5);
+
+		mockFs.mockDirectory(dirUri, [[fileName, FileType.File]]);
+		mockFs.mockFile(URI.joinPath(dirUri, fileName), largeFileContents, 1000);
+
+		// Should not throw an error for large files
+		const sessions = await service.getAllSessions(CancellationToken.None);
+
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0].id).toBe('large-session');
+		// Verify we loaded all messages
+		expect(sessions[0].messages).toHaveLength(6000);
 	});
 
 	it('loads 2 sessions from 3 real fixture files', async () => {
@@ -567,6 +613,53 @@ describe('ClaudeCodeSessionService', () => {
 
 			expect(sessions).toHaveLength(1);
 			expect(sessions[0].id).toBe('shared-session');
+		});
+	});
+
+	describe('workspace with spaces in path', () => {
+		const spaceFolderPath = '/Users/test/my project';
+		const spaceFolderUri = URI.file(spaceFolderPath);
+		const spaceSlug = computeFolderSlug(spaceFolderUri);
+		let spaceDirUri: URI;
+		let spaceService: ClaudeCodeSessionService;
+		let spaceMockFs: MockFileSystemService;
+
+		beforeEach(() => {
+			spaceMockFs = new MockFileSystemService();
+			const spaceTestingServiceCollection = store.add(createExtensionUnitTestingServices(store));
+			spaceTestingServiceCollection.set(IFileSystemService, spaceMockFs);
+
+			const spaceWorkspaceService = store.add(new TestWorkspaceService([spaceFolderUri]));
+			spaceTestingServiceCollection.set(IWorkspaceService, spaceWorkspaceService);
+
+			const accessor = spaceTestingServiceCollection.createTestingAccessor();
+			spaceMockFs = accessor.get(IFileSystemService) as MockFileSystemService;
+			const instaService = accessor.get(IInstantiationService);
+			const nativeEnvService = accessor.get(INativeEnvService);
+			spaceDirUri = URI.joinPath(nativeEnvService.userHome, '.claude', 'projects', spaceSlug);
+			spaceService = instaService.createInstance(ClaudeCodeSessionService);
+		});
+
+		it('loads sessions from directory with spaces normalized to dashes', async () => {
+			const fileName = 'space-session.jsonl';
+			const fileContents = JSON.stringify({
+				parentUuid: null,
+				sessionId: 'space-session',
+				type: 'user',
+				message: { role: 'user', content: 'session in space folder' },
+				uuid: 'uuid-space',
+				timestamp: new Date().toISOString()
+			});
+
+			spaceMockFs.mockDirectory(spaceDirUri, [[fileName, FileType.File]]);
+			spaceMockFs.mockFile(URI.joinPath(spaceDirUri, fileName), fileContents, 1000);
+
+			const sessions = await spaceService.getAllSessions(CancellationToken.None);
+
+			expect(sessions).toHaveLength(1);
+			expect(sessions[0].id).toBe('space-session');
+			// Verify the slug used for the directory has spaces converted to dashes
+			expect(spaceSlug).toBe('-Users-test-my-project');
 		});
 	});
 });

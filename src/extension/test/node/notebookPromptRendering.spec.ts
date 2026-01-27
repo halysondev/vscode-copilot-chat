@@ -135,6 +135,12 @@ describe('Notebook Prompt Rendering', function () {
 			override applyEdit(edit: vscode.WorkspaceEdit): Thenable<boolean> {
 				throw new Error('Method not implemented.');
 			}
+			override requestResourceTrust(_options: vscode.ResourceTrustRequestOptions): Thenable<boolean | undefined> {
+				return Promise.resolve(true);
+			}
+			override requestWorkspaceTrust(_options?: vscode.WorkspaceTrustRequestOptions): Thenable<boolean | undefined> {
+				return Promise.resolve(true);
+			}
 
 		});
 		testingServiceCollection.define(IExperimentationService, new class extends NullExperimentationService {
@@ -197,7 +203,8 @@ describe('Notebook Prompt Rendering', function () {
 			debug: () => { /* no-op */ },
 			trace: () => { /* no-op */ },
 			show: () => { /* no-op */ },
-			createSubLogger(): ILogger { return mockLogger; }
+			createSubLogger(): ILogger { return mockLogger; },
+			withExtraTarget(): ILogger { return mockLogger; }
 		};
 		testingServiceCollection.define(IAlternativeNotebookContentService, new SimulationAlternativeNotebookContentService('json'));
 		testingServiceCollection.define(IAlternativeNotebookContentEditGenerator, new AlternativeNotebookContentEditGenerator(new SimulationAlternativeNotebookContentService('json'), new DiffServiceImpl(), new class implements ILogService {
@@ -213,6 +220,9 @@ describe('Notebook Prompt Rendering', function () {
 				//
 			}
 			createSubLogger(): ILogger {
+				return this;
+			}
+			withExtraTarget(): ILogger {
 				return this;
 			}
 		}(), new NullTelemetryService()));

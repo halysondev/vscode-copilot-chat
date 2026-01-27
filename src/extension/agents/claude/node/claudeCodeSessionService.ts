@@ -337,7 +337,8 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 		const summaries = new Map<string, SummaryEntry>();
 		try {
 			// Read and parse the JSONL file
-			const content = await this._fileSystem.readFile(fileUri);
+			// Claude session files can be large (>5MB), so we disable the size limit
+			const content = await this._fileSystem.readFile(fileUri, true);
 			if (token.isCancellationRequested) {
 				throw new CancellationError();
 			}
@@ -408,7 +409,7 @@ export class ClaudeCodeSessionService implements IClaudeCodeSessionService {
 	private _computeFolderSlug(folderUri: URI): string {
 		return folderUri.path
 			.replace(/^\/([a-z]):/i, (_, driveLetter) => driveLetter.toUpperCase() + '-')
-			.replace(/[\/\.]/g, '-');
+			.replace(/[\/ .]/g, '-');
 	}
 
 	private _generateSessionLabel(summaryEntry: SummaryEntry | undefined, messages: SDKMessage[]): string {
