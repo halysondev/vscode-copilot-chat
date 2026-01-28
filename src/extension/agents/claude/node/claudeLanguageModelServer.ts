@@ -29,7 +29,7 @@ import { IInstantiationService } from '../../../../util/vs/platform/instantiatio
 import { claudeCodeReasoningConfig } from './claude-code';
 import { IClaudeCodeModels } from './claudeCodeModels';
 import { claudeCodeOAuthManager, generateUserId } from './oauth';
-import { createStreamingMessage, StreamThinkingCompleteChunk, StreamToolCallPartialChunk, ThinkingConfig } from './streaming-client';
+import { AnthropicAPIError, createStreamingMessage, StreamThinkingCompleteChunk, StreamToolCallPartialChunk, ThinkingConfig } from './streaming-client';
 
 export interface IClaudeLanguageModelServerConfig {
 	readonly port: number;
@@ -175,20 +175,18 @@ export class ClaudeLanguageModelServer extends Disposable {
 	}
 
 	/**
-	 * Handle request via direct OAuth-authenticated Anthropic API call
+	 * Handle request via direct OAuth-authenticated Anthropic API call.
+	 *
+	 * IMPORTANT: writeHead(200) is NOT sent here — it is deferred to
+	 * streamWithOAuthToken so that pre-stream API errors (429, 529, etc.)
+	 * can be returned as proper HTTP error responses. This enables the
+	 * SDK's built-in retry logic for transient errors.
 	 */
 	private async handleOAuthRequest(
 		requestBody: AnthropicMessagesRequest,
 		accessToken: string,
 		res: http.ServerResponse
 	): Promise<void> {
-		// Set up streaming response
-		res.writeHead(200, {
-			'Content-Type': 'text/event-stream',
-			'Cache-Control': 'no-cache',
-			'Connection': 'keep-alive',
-		});
-
 		// Create abort controller for request cancellation
 		const abortController = new AbortController();
 		res.on('close', () => {
@@ -200,7 +198,7 @@ export class ClaudeLanguageModelServer extends Disposable {
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 
-			// Check if it's an abort (client closed connection) - this is normal, just end quietly
+			// Abort (client closed connection) is normal — just end quietly
 			if (abortController.signal.aborted || errorMessage.includes('aborted') || errorMessage.includes('AbortError')) {
 				this.trace(`OAuth request aborted (client closed connection)`);
 				if (!res.writableEnded) {
@@ -209,8 +207,11 @@ export class ClaudeLanguageModelServer extends Disposable {
 				return;
 			}
 
-			// Check if it's an auth error - try to refresh and retry
-			if (errorMessage.includes('401') || errorMessage.includes('authentication') || errorMessage.includes('unauthorized')) {
+			// Auth error before streaming started — try to refresh token and retry
+			const isAuthError = error instanceof AnthropicAPIError
+				? error.statusCode === 401
+				: (errorMessage.includes('authentication') || errorMessage.includes('unauthorized'));
+			if (!res.headersSent && isAuthError) {
 				this.info('OAuth token may be expired, attempting refresh...');
 				try {
 					const newToken = await claudeCodeOAuthManager.forceRefreshAccessToken();
@@ -224,10 +225,20 @@ export class ClaudeLanguageModelServer extends Disposable {
 					}
 				} catch (refreshError) {
 					this.error(`Token refresh failed: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+					// Fall through to error response below
 				}
 			}
 
-			// Send error as SSE event since headers are already sent
+			// Pre-stream error (headers not sent) — return proper HTTP error so the
+			// SDK can use its built-in retry logic for 429/529 errors
+			if (!res.headersSent) {
+				const statusCode = error instanceof AnthropicAPIError ? error.statusCode : 502;
+				this.error(`OAuth API error (${statusCode}): ${errorMessage}`);
+				this.sendErrorResponse(res, statusCode, 'api_error', errorMessage);
+				return;
+			}
+
+			// Mid-stream error (headers already sent) — send as SSE error event
 			this.error(`OAuth streaming error: ${errorMessage}`);
 			if (!res.writableEnded) {
 				res.write(formatSSE('error', {
@@ -316,12 +327,54 @@ export class ClaudeLanguageModelServer extends Disposable {
 		// Track if we have any tool_use blocks to determine stop_reason
 		let hasToolUse = false;
 
+		// Helper: ensure HTTP headers are sent before writing any SSE data.
+		// Headers are deferred so that pre-stream API errors (429, 529, etc.)
+		// can be returned as proper HTTP error responses to the SDK.
+		const ensureHeadersSent = () => {
+			if (!res.headersSent) {
+				res.writeHead(200, {
+					'Content-Type': 'text/event-stream',
+					'Cache-Control': 'no-cache',
+					'Connection': 'keep-alive',
+				});
+			}
+		};
+
 		for await (const chunk of stream) {
 			this.trace(`[OAuth] Received chunk: ${chunk.type}${chunk.type === 'tool_call_partial' ? ` (id=${(chunk as StreamToolCallPartialChunk).id}, name=${(chunk as StreamToolCallPartialChunk).name})` : ''}`);
 
-			// Send message_start on first chunk
+			// Handle message_start_info: forward the real usage data from the API
+			if (chunk.type === 'message_start_info') {
+				ensureHeadersSent();
+				if (!messageStartSent) {
+					res.write(formatSSE('message_start', {
+						type: 'message_start',
+						message: {
+							id: chunk.messageId || `msg_${generateUuid()}`,
+							type: 'message',
+							role: 'assistant',
+							content: [],
+							model: requestBody.model,
+							stop_reason: null,
+							stop_sequence: null,
+							usage: {
+								input_tokens: chunk.usage.inputTokens,
+								output_tokens: chunk.usage.outputTokens,
+								cache_read_input_tokens: chunk.usage.cacheReadTokens,
+								cache_creation_input_tokens: chunk.usage.cacheWriteTokens,
+							},
+						},
+					}));
+					messageStartSent = true;
+				}
+				continue;
+			}
+
+			// For any content chunk, ensure headers and message_start are sent
+			ensureHeadersSent();
 			if (!messageStartSent) {
-				const messageStart = formatSSE('message_start', {
+				// Fallback: if message_start_info was not received, send with zeros
+				res.write(formatSSE('message_start', {
 					type: 'message_start',
 					message: {
 						id: `msg_${generateUuid()}`,
@@ -333,8 +386,7 @@ export class ClaudeLanguageModelServer extends Disposable {
 						stop_sequence: null,
 						usage: { input_tokens: 0, output_tokens: 0 },
 					},
-				});
-				res.write(messageStart);
+				}));
 				messageStartSent = true;
 			}
 

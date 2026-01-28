@@ -264,6 +264,21 @@ export const CLAUDE_CODE_API_CONFIG = {
 } as const;
 
 /**
+ * Custom error for Anthropic API non-200 responses.
+ * Carries the HTTP status code so the proxy can return the correct status
+ * to the SDK, enabling proper retry logic (e.g. for 429, 529).
+ */
+export class AnthropicAPIError extends Error {
+	constructor(
+		public readonly statusCode: number,
+		message: string,
+	) {
+		super(message);
+		this.name = 'AnthropicAPIError';
+	}
+}
+
+/**
  * SSE Event types from Anthropic streaming API
  */
 export type SSEEventType =
@@ -452,6 +467,23 @@ export interface StreamErrorChunk {
 	error: string;
 }
 
+/**
+ * Contains the real usage data from the API's message_start event.
+ * This allows the proxy to forward actual input token counts to the SDK
+ * instead of hardcoded zeros.
+ */
+export interface StreamMessageStartChunk {
+	type: "message_start_info";
+	messageId: string;
+	model: string;
+	usage: {
+		inputTokens: number;
+		outputTokens: number;
+		cacheReadTokens: number;
+		cacheWriteTokens: number;
+	};
+}
+
 export type StreamChunk =
 	| StreamTextChunk
 	| StreamReasoningChunk
@@ -459,6 +491,7 @@ export type StreamChunk =
 	| StreamToolCallPartialChunk
 	| StreamUsageChunk
 	| StreamErrorChunk
+	| StreamMessageStartChunk
 
 /**
  * Creates a streaming message request to the Anthropic API using OAuth
@@ -554,7 +587,7 @@ export async function* createStreamingMessage(options: StreamMessageOptions): As
 
 	if (!response.ok) {
 		const errorText = await response.text();
-		console.error(`[claude-code-streaming] API error response: ${errorText}`);
+		console.error(`[claude-code-streaming] API error response (${response.status}): ${errorText}`);
 		let errorMessage = `API request failed: ${response.status} ${response.statusText}`;
 		try {
 			const errorJson = JSON.parse(errorText);
@@ -566,8 +599,10 @@ export async function* createStreamingMessage(options: StreamMessageOptions): As
 				errorMessage += ` - ${errorText}`;
 			}
 		}
-		yield { type: "error", error: errorMessage };
-		return;
+		// Throw instead of yielding so the proxy can return a proper HTTP error
+		// response with the correct status code, enabling the SDK's built-in
+		// retry logic for 429 (rate limit) and 529 (overloaded) errors.
+		throw new AnthropicAPIError(response.status, errorMessage);
 	}
 
 	if (!response.body) {
@@ -631,6 +666,18 @@ export async function* createStreamingMessage(options: StreamMessageOptions): As
 							cacheReadTokens += usage.cache_read_input_tokens || 0;
 							cacheWriteTokens += usage.cache_creation_input_tokens || 0;
 						}
+						// Yield message start info so the proxy can forward real usage to the SDK
+						yield {
+							type: "message_start_info" as const,
+							messageId: (message.id as string) || "",
+							model: (message.model as string) || "",
+							usage: {
+								inputTokens: totalInputTokens,
+								outputTokens: totalOutputTokens,
+								cacheReadTokens,
+								cacheWriteTokens,
+							},
+						};
 						break;
 					}
 
