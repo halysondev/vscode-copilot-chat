@@ -6,7 +6,9 @@
 import { AskUserQuestionInput } from '@anthropic-ai/claude-agent-sdk/sdk-tools';
 import { CancellationToken } from '../../../../../util/vs/base/common/cancellation';
 import { LanguageModelTextPart } from '../../../../../vscodeTypes';
+import { IBuildPromptContext } from '../../../../prompt/common/intents';
 import { ToolName } from '../../../../tools/common/toolNames';
+import { CopilotToolMode } from '../../../../tools/common/toolsRegistry';
 import { IToolsService } from '../../../../tools/common/toolsService';
 import { IAnswerResult } from '../../../../tools/vscode-node/askQuestionsTool';
 import {
@@ -35,6 +37,15 @@ export class AskUserQuestionHandler implements IClaudeToolPermissionHandler<Clau
 		context: ClaudeToolPermissionContext
 	): Promise<ClaudeToolPermissionResult> {
 		try {
+			// Set up the AskQuestions tool's prompt context with the stream
+			// so it can show the question carousel UI
+			if (context.stream) {
+				const copilotTool = this.toolsService.getCopilotTool(ToolName.AskQuestions);
+				if (copilotTool?.resolveInput) {
+					await copilotTool.resolveInput(input, { stream: context.stream } as IBuildPromptContext, CopilotToolMode.FullContext);
+				}
+			}
+
 			// Invoke the AskQuestions tool
 			const result = await this.toolsService.invokeTool(
 				ToolName.AskQuestions,
