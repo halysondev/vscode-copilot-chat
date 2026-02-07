@@ -305,6 +305,9 @@ export type ThinkingConfig =
 		budget_tokens: number;
 	}
 	| {
+		type: "adaptive";
+	}
+	| {
 		type: "disabled";
 	}
 
@@ -318,6 +321,7 @@ export interface StreamMessageOptions {
 	messages: Anthropic.Messages.MessageParam[];
 	maxTokens?: number;
 	thinking?: ThinkingConfig;
+	outputConfig?: { effort: string };
 	tools?: Anthropic.Messages.Tool[];
 	toolChoice?: Anthropic.Messages.ToolChoice;
 	metadata?: {
@@ -497,7 +501,7 @@ export type StreamChunk =
  * Creates a streaming message request to the Anthropic API using OAuth
  */
 export async function* createStreamingMessage(options: StreamMessageOptions): AsyncGenerator<StreamChunk> {
-	const { accessToken, model, systemPrompt, messages, maxTokens, thinking, tools, toolChoice, metadata, signal } =
+	const { accessToken, model, systemPrompt, messages, maxTokens, thinking, outputConfig, tools, toolChoice, metadata, signal } =
 		options;
 
 	// Filter out non-Anthropic blocks before processing
@@ -530,6 +534,11 @@ export async function* createStreamingMessage(options: StreamMessageOptions): As
 	// Add thinking configuration for extended thinking mode
 	if (thinking) {
 		body.thinking = thinking;
+	}
+
+	// Add output_config for effort-based thinking (Opus 4.6 adaptive thinking)
+	if (outputConfig) {
+		body.output_config = outputConfig;
 	}
 
 	// System prompt as array of content blocks (Claude Code format)
@@ -573,6 +582,7 @@ export async function* createStreamingMessage(options: StreamMessageOptions): As
 	console.log(`[claude-code-streaming] Messages count: ${messagesWithPrefixedTools.length}`);
 	console.log(`[claude-code-streaming] Tools count: ${tools?.length ?? 0}`);
 	console.log(`[claude-code-streaming] Thinking: ${JSON.stringify(thinking)}`);
+	console.log(`[claude-code-streaming] Output config: ${JSON.stringify(outputConfig)}`);
 	console.log(`[claude-code-streaming] Max tokens: ${maxTokens}`);
 
 	// Make the request

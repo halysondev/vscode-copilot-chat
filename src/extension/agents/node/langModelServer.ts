@@ -298,7 +298,7 @@ export class LanguageModelServer implements ILanguageModelServer {
 				mappedModel = 'claude-sonnet-4.5';
 			}
 			if (requestedModel.startsWith('claude-opus-4')) {
-				mappedModel = 'claude-opus-4.5';
+				mappedModel = 'claude-opus-4.6';
 			}
 
 			// Try to find exact match first
@@ -310,7 +310,7 @@ export class LanguageModelServer implements ILanguageModelServer {
 			} else if (!selectedEndpoint && requestedModel.startsWith('claude-sonnet-4')) {
 				selectedEndpoint = endpoints.find(e => e.model.includes('claude-sonnet-4-5')) ?? endpoints.find(e => e.model.includes('claude'));
 			} else if (!selectedEndpoint && requestedModel.startsWith('claude-opus-4')) {
-				selectedEndpoint = endpoints.find(e => e.model.includes('claude-opus-4-5')) ?? endpoints.find(e => e.model.includes('claude'));
+				selectedEndpoint = endpoints.find(e => e.model.includes('claude-opus-4-6')) ?? endpoints.find(e => e.model.includes('claude'));
 			}
 
 			return selectedEndpoint;

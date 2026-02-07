@@ -26,7 +26,7 @@ import { Disposable, toDisposable } from '../../../../util/vs/base/common/lifecy
 import { SSEParser } from '../../../../util/vs/base/common/sseParser';
 import { generateUuid } from '../../../../util/vs/base/common/uuid';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
-import { claudeCodeReasoningConfig } from './claude-code';
+import { claudeCodeReasoningConfig, isOpus46Model } from './claude-code';
 import { IClaudeCodeModels } from './claudeCodeModels';
 import { claudeCodeOAuthManager, generateUserId } from './oauth';
 import { AnthropicAPIError, createStreamingMessage, StreamThinkingCompleteChunk, StreamToolCallPartialChunk, ThinkingConfig } from './streaming-client';
@@ -281,26 +281,42 @@ export class ClaudeLanguageModelServer extends Disposable {
 		const systemPrompt = extractSystemPrompt(requestBody);
 		this.trace(`[OAuth] System prompt length: ${systemPrompt.length}`);
 
-		// Build thinking config based on model's reasoning effort setting
+		// Build thinking config and output config based on model's reasoning effort setting
 		let thinking: ThinkingConfig | undefined;
+		let outputConfig: { effort: string } | undefined;
 		if (requestBody.thinking) {
+			// SDK provided explicit thinking config - respect it
 			const thinkingInput = requestBody.thinking as { type?: string; budget_tokens?: number };
 			if (thinkingInput.type === 'enabled' && thinkingInput.budget_tokens) {
 				thinking = { type: 'enabled', budget_tokens: thinkingInput.budget_tokens };
+			} else if (thinkingInput.type === 'adaptive') {
+				thinking = { type: 'adaptive' };
 			} else if (thinkingInput.type === 'disabled') {
 				thinking = { type: 'disabled' };
 			}
 		} else {
 			// Get user's selected reasoning effort from service
-			const reasoningEffort = this.claudeCodeModels.getReasoningEffort();
+			let reasoningEffort = this.claudeCodeModels.getReasoningEffort();
+			const modelIsOpus46 = isOpus46Model(requestBody.model);
+
+			// Validate: 'max' effort is only valid for Opus 4.6
+			if (reasoningEffort === 'max' && !modelIsOpus46) {
+				reasoningEffort = 'high';
+			}
+
 			if (reasoningEffort === 'disable') {
 				thinking = undefined; // No thinking
+			} else if (modelIsOpus46) {
+				// Opus 4.6: Use adaptive thinking with output_config effort
+				thinking = { type: 'adaptive' };
+				outputConfig = { effort: reasoningEffort };
 			} else {
-				const reasoningConfig = claudeCodeReasoningConfig[reasoningEffort];
+				// Other models: Use budget_tokens-based thinking
+				const reasoningConfig = claudeCodeReasoningConfig[reasoningEffort as keyof typeof claudeCodeReasoningConfig];
 				thinking = { type: 'enabled', budget_tokens: reasoningConfig.budgetTokens };
 			}
 		}
-		this.info(`[OAuth] Model: ${requestBody.model}, Thinking config: ${JSON.stringify(thinking)}`);
+		this.info(`[OAuth] Model: ${requestBody.model}, Thinking config: ${JSON.stringify(thinking)}, Output config: ${JSON.stringify(outputConfig)}`);
 
 		// Generate user_id for Claude Code API
 		const email = await claudeCodeOAuthManager.getEmail();
@@ -328,6 +344,7 @@ export class ClaudeLanguageModelServer extends Disposable {
 			messages: requestBody.messages as Anthropic.Messages.MessageParam[],
 			maxTokens: requestBody.max_tokens,
 			thinking,
+			outputConfig,
 			tools: requestBody.tools as Anthropic.Messages.Tool[] | undefined,
 			toolChoice: requestBody.tool_choice as Anthropic.Messages.ToolChoice | undefined,
 			metadata: { user_id: userId },
@@ -544,10 +561,6 @@ export class ClaudeLanguageModelServer extends Disposable {
 		const tokenSource = new CancellationTokenSource();
 
 		try {
-			// Determine if this is a user-initiated message
-			const lastMessage = requestBody.messages?.at(-1);
-			const isUserInitiatedMessage = lastMessage?.role === 'user';
-
 			const allEndpoints = await this.endpointProvider.getAllChatEndpoints();
 			// Filter to only endpoints that support the Messages API
 			const endpoints = allEndpoints.filter(e => e.apiType === 'messages');

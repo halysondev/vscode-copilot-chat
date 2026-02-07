@@ -30,7 +30,6 @@ import { completeToolInvocation, createFormattedToolInvocation } from '../common
 import { IClaudeCodeSdkService } from './claudeCodeSdkService';
 import { ClaudeLanguageModelServer, IClaudeLanguageModelServerConfig } from './claudeLanguageModelServer';
 import { ClaudeSettingsChangeTracker } from './claudeSettingsChangeTracker';
-import { claudeCodeOAuthManager } from './oauth';
 import { SYNTHETIC_MODEL_ID } from './sessionParser/claudeSessionSchema';
 
 // Manages Claude Code agent interactions and language model server lifecycle

@@ -16,6 +16,7 @@ import { basename } from '../../../util/vs/base/common/resources';
 import { URI } from '../../../util/vs/base/common/uri';
 import { ClaudeFolderInfo } from '../../agents/claude/common/claudeFolderInfo';
 import { ClaudeAgentManager } from '../../agents/claude/node/claudeCodeAgent';
+import { ClaudeCodeReasoningLevel, isOpus46Model } from '../../agents/claude/node/claude-code';
 import { IClaudeCodeModels, NoClaudeModelsAvailableError } from '../../agents/claude/node/claudeCodeModels';
 import { IClaudeSessionStateService } from '../../agents/claude/node/claudeSessionStateService';
 import { IClaudeCodeSessionService } from '../../agents/claude/node/sessionParser/claudeCodeSessionService';
@@ -347,8 +348,11 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 			permissionModeItems.push({ id: 'bypassPermissions', name: l10n.t('Bypass all permissions') });
 		}
 
-		// Get reasoning effort options
-		const reasoningEffortOptions = this.claudeCodeModels.getReasoningEffortOptions();
+		// Get the current default model to determine available reasoning options
+		const defaultModelId = models.length > 0 ? (await this.claudeCodeModels.getDefaultModel()) : undefined;
+
+		// Get reasoning effort options (model-aware: 'max' only shows for Opus 4.6)
+		const reasoningEffortOptions = this.claudeCodeModels.getReasoningEffortOptions(defaultModelId);
 		const currentReasoningEffort = this.claudeCodeModels.getReasoningEffort();
 		const reasoningEffortItems: vscode.ChatSessionProviderOptionItem[] = reasoningEffortOptions.map(opt => ({
 			id: opt.id,
@@ -409,13 +413,23 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 				this._updateLastKnown(sessionId, { modelId: update.value });
 				void this.claudeCodeModels.setDefaultModel(update.value);
 				this.sessionStateService.setModelIdForSession(sessionId, update.value);
+
+				// If current reasoning effort is 'max' and new model doesn't support it, fall back to 'high'
+				const currentEffort = this.claudeCodeModels.getReasoningEffort();
+				if (currentEffort === 'max' && update.value && !isOpus46Model(update.value)) {
+					void this.claudeCodeModels.setReasoningEffort('high');
+				}
+
+				// Refresh provider options so reasoning effort dropdown updates
+				// (e.g., 'max' only shows for Opus 4.6)
+				this._onDidChangeChatSessionProviderOptions.fire();
 			} else if (update.optionId === PERMISSION_MODE_OPTION_ID) {
 				// Update last known first so the event listener won't fire back to UI
 				this._updateLastKnown(sessionId, { permissionMode: update.value as PermissionMode });
 				this.sessionStateService.setPermissionModeForSession(sessionId, update.value as PermissionMode);
 			} else if (update.optionId === REASONING_EFFORT_OPTION_ID && update.value) {
 				// Reasoning effort is a global setting, not per-session
-				void this.claudeCodeModels.setReasoningEffort(update.value as 'low' | 'medium' | 'high');
+				void this.claudeCodeModels.setReasoningEffort(update.value as ClaudeCodeReasoningLevel);
 			} else if (update.optionId === FOLDER_OPTION_ID && typeof update.value === 'string') {
 				this._sessionFolders.set(sessionId, URI.file(update.value));
 			}

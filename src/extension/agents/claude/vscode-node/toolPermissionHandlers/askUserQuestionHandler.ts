@@ -6,7 +6,6 @@
 import { AskUserQuestionInput } from '@anthropic-ai/claude-agent-sdk/sdk-tools';
 import { CancellationToken } from '../../../../../util/vs/base/common/cancellation';
 import { LanguageModelTextPart } from '../../../../../vscodeTypes';
-import { IBuildPromptContext } from '../../../../prompt/common/intents';
 import { ToolName } from '../../../../tools/common/toolNames';
 import { CopilotToolMode, ICopilotTool } from '../../../../tools/common/toolsRegistry';
 import { IToolsService } from '../../../../tools/common/toolsService';

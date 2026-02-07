@@ -43,3 +43,4 @@ claude.MD
 settings.local.json
 
 *.vsix
+nul

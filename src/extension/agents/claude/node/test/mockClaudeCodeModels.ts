@@ -6,7 +6,7 @@
 import { IEndpointProvider } from '../../../../../platform/endpoint/common/endpointProvider';
 import { IVSCodeExtensionContext } from '../../../../../platform/extContext/common/extensionContext';
 import { ILogService } from '../../../../../platform/log/common/logService';
-import { ClaudeCodeReasoningLevel } from '../claude-code';
+import { ClaudeCodeReasoningLevel, isOpus46Model } from '../claude-code';
 import { ClaudeCodeModelInfo, ClaudeCodeModels } from '../claudeCodeModels';
 
 export class MockClaudeCodeModels extends ClaudeCodeModels {
@@ -26,23 +26,30 @@ export class MockClaudeCodeModels extends ClaudeCodeModels {
 			{ id: 'claude-opus-4-20250514', name: 'Claude Opus 4' },
 			{ id: 'claude-haiku-3-5-20250514', name: 'Claude Haiku 3.5' },
 			{ id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5' },
+			{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
 		];
 	}
 
-	getReasoningEffort(): ClaudeCodeReasoningLevel {
+	override getReasoningEffort(): ClaudeCodeReasoningLevel {
 		return this._reasoningEffort;
 	}
 
-	async setReasoningEffort(level: ClaudeCodeReasoningLevel): Promise<void> {
+	override async setReasoningEffort(level: ClaudeCodeReasoningLevel): Promise<void> {
 		this._reasoningEffort = level;
 	}
 
-	getReasoningEffortOptions(): { id: ClaudeCodeReasoningLevel; name: string; description: string }[] {
-		return [
+	override getReasoningEffortOptions(modelId?: string): { id: ClaudeCodeReasoningLevel; name: string; description: string }[] {
+		const options: { id: ClaudeCodeReasoningLevel; name: string; description: string }[] = [
 			{ id: 'disable', name: 'Disable', description: 'No thinking' },
 			{ id: 'low', name: 'Low', description: '16,000 tokens' },
 			{ id: 'medium', name: 'Medium', description: '32,000 tokens' },
 			{ id: 'high', name: 'High', description: '64,000 tokens' },
 		];
+
+		if (modelId && isOpus46Model(modelId)) {
+			options.push({ id: 'max', name: 'Max', description: 'Maximum thinking (Opus 4.6 only)' });
+		}
+
+		return options;
 	}
 }

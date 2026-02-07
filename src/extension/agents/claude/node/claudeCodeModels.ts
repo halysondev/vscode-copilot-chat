@@ -8,7 +8,7 @@ import { IVSCodeExtensionContext } from '../../../../platform/extContext/common/
 import { ILogService } from '../../../../platform/log/common/logService';
 import { createServiceIdentifier } from '../../../../util/common/services';
 import { Lazy } from '../../../../util/vs/base/common/lazy';
-import { claudeCodeModels, claudeCodeReasoningConfig, ClaudeCodeModelId, ClaudeCodeReasoningLevel } from './claude-code';
+import { claudeCodeModels, claudeCodeReasoningConfig, ClaudeCodeModelId, ClaudeCodeReasoningLevel, isOpus46Model } from './claude-code';
 import { claudeCodeOAuthManager } from './oauth';
 
 const CLAUDE_CODE_MODEL_MEMENTO_KEY = 'github.copilot.claudeCode.sessionModel';
@@ -39,7 +39,7 @@ export interface IClaudeCodeModels {
 	getModels(): Promise<ClaudeCodeModelInfo[]>;
 	getReasoningEffort(): ClaudeCodeReasoningLevel;
 	setReasoningEffort(level: ClaudeCodeReasoningLevel): Promise<void>;
-	getReasoningEffortOptions(): { id: ClaudeCodeReasoningLevel; name: string; description: string }[];
+	getReasoningEffortOptions(modelId?: string): { id: ClaudeCodeReasoningLevel; name: string; description: string }[];
 	/**
 	 * Maps an SDK model ID to the best matching endpoint model ID.
 	 * SDK model IDs are raw Anthropic API model IDs (e.g., 'claude-opus-4-5-20251101').
@@ -89,7 +89,7 @@ export class ClaudeCodeModels implements IClaudeCodeModels {
 
 	public getReasoningEffort(): ClaudeCodeReasoningLevel {
 		const stored = this.extensionContext.globalState.get<string>(CLAUDE_CODE_REASONING_EFFORT_KEY);
-		if (stored === 'disable' || (stored && stored in claudeCodeReasoningConfig)) {
+		if (stored === 'disable' || stored === 'max' || (stored && stored in claudeCodeReasoningConfig)) {
 			return stored as ClaudeCodeReasoningLevel;
 		}
 		return 'high'; // Default to high
@@ -99,13 +99,20 @@ export class ClaudeCodeModels implements IClaudeCodeModels {
 		await this.extensionContext.globalState.update(CLAUDE_CODE_REASONING_EFFORT_KEY, level);
 	}
 
-	public getReasoningEffortOptions(): { id: ClaudeCodeReasoningLevel; name: string; description: string }[] {
-		return [
+	public getReasoningEffortOptions(modelId?: string): { id: ClaudeCodeReasoningLevel; name: string; description: string }[] {
+		const options: { id: ClaudeCodeReasoningLevel; name: string; description: string }[] = [
 			{ id: 'disable', name: 'Disable', description: 'No thinking' },
 			{ id: 'low', name: 'Low', description: `${claudeCodeReasoningConfig.low.budgetTokens.toLocaleString()} tokens` },
 			{ id: 'medium', name: 'Medium', description: `${claudeCodeReasoningConfig.medium.budgetTokens.toLocaleString()} tokens` },
 			{ id: 'high', name: 'High', description: `${claudeCodeReasoningConfig.high.budgetTokens.toLocaleString()} tokens` },
 		];
+
+		// 'max' effort is only available for Opus 4.6
+		if (modelId && isOpus46Model(modelId)) {
+			options.push({ id: 'max', name: 'Max', description: 'Maximum thinking (Opus 4.6 only)' });
+		}
+
+		return options;
 	}
 
 	public async getModels(): Promise<ClaudeCodeModelInfo[]> {
