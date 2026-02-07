@@ -152,5 +152,7 @@
 	"githubPullRequests.codingAgent.uiIntegration": true,
 	"python-envs.defaultEnvManager": "ms-python.python:system",
 	"python-envs.pythonProjects": [],
-	"cmake.sourceDirectory": "C:/Users/halys/vscode-copilot-chat/node_modules/bare-fs",
+	"chat.tools.terminal.autoApprove": {
+		"npx vitest": true
+	}
 }

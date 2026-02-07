@@ -154,6 +154,7 @@ export interface ContextManagementResponse {
  * - Claude Haiku 4.5 (claude-haiku-4-5-* or claude-haiku-4.5-*)
  * - Claude Sonnet 4.5 (claude-sonnet-4-5-* or claude-sonnet-4.5-*)
  * - Claude Sonnet 4 (claude-sonnet-4-*)
+ * - Claude Opus 4.6 (claude-opus-4-6-* or claude-opus-4.6-*)
  * - Claude Opus 4.5 (claude-opus-4-5-* or claude-opus-4.5-*)
  * - Claude Opus 4.1 (claude-opus-4-1-* or claude-opus-4.1-*)
  * - Claude Opus 4 (claude-opus-4-*)
@@ -166,13 +167,15 @@ export function modelSupportsContextEditing(modelId: string): boolean {
 	return normalized.startsWith('claude-haiku-4-5') ||
 		normalized.startsWith('claude-sonnet-4-5') ||
 		normalized.startsWith('claude-sonnet-4') ||
+		normalized.startsWith('claude-opus-4-6') ||
 		normalized.startsWith('claude-opus-4-5') ||
 		normalized.startsWith('claude-opus-4-1') ||
 		normalized.startsWith('claude-opus-4');
 }
 
 /**
- * Tool search is only supported by:
+ * Tool search is supported by:
+ * - Claude Opus 4.6 (claude-opus-4-6-* or claude-opus-4.6-*)
  * - Claude Opus 4.5 (claude-opus-4-5-* or claude-opus-4.5-*)
  * @param modelId The model ID to check
  * @returns true if the model supports tool search
@@ -182,7 +185,26 @@ export function modelSupportsToolSearch(modelId: string): boolean {
 	const normalized = modelId.toLowerCase().replace(/\./g, '-');
 	// TODO: Enable sonnet tool search when supported by all providers
 	// return normalized.startsWith('claude-sonnet-4-5') ||
-	return normalized.startsWith('claude-opus-4-5');
+	return normalized.startsWith('claude-opus-4-6') ||
+		normalized.startsWith('claude-opus-4-5');
+}
+
+/**
+ * Interleaved thinking is supported by:
+ * - Claude Sonnet 4.5 (claude-sonnet-4-5-* or claude-sonnet-4.5-*)
+ * - Claude Sonnet 4 (claude-sonnet-4-*)
+ * - Claude Haiku 4.5 (claude-haiku-4-5-* or claude-haiku-4.5-*)
+ * - Claude Opus 4.5 (claude-opus-4-5-* or claude-opus-4.5-*)
+ * @param modelId The model ID to check
+ * @returns true if the model supports interleaved thinking
+ */
+export function modelSupportsInterleavedThinking(modelId: string): boolean {
+	// Normalize: lowercase and replace dots with dashes so "4.5" matches "4-5"
+	const normalized = modelId.toLowerCase().replace(/\./g, '-');
+	return normalized.startsWith('claude-sonnet-4-5') ||
+		normalized.startsWith('claude-sonnet-4') ||
+		normalized.startsWith('claude-haiku-4-5') ||
+		normalized.startsWith('claude-opus-4-5');
 }
 
 /**
@@ -190,6 +212,7 @@ export function modelSupportsToolSearch(modelId: string): boolean {
  * - Claude Haiku 4.5 (claude-haiku-4-5-* or claude-haiku-4.5-*)
  * - Claude Sonnet 4.5 (claude-sonnet-4-5-* or claude-sonnet-4.5-*)
  * - Claude Sonnet 4 (claude-sonnet-4-*)
+ * - Claude Opus 4.6 (claude-opus-4-6-* or claude-opus-4.6-*)
  * - Claude Opus 4.5 (claude-opus-4-5-* or claude-opus-4.5-*)
  * - Claude Opus 4.1 (claude-opus-4-1-* or claude-opus-4.1-*)
  * - Claude Opus 4 (claude-opus-4-*)
@@ -201,6 +224,7 @@ export function modelSupportsMemory(modelId: string): boolean {
 	return normalized.startsWith('claude-haiku-4-5') ||
 		normalized.startsWith('claude-sonnet-4-5') ||
 		normalized.startsWith('claude-sonnet-4') ||
+		normalized.startsWith('claude-opus-4-6') ||
 		normalized.startsWith('claude-opus-4-5') ||
 		normalized.startsWith('claude-opus-4-1') ||
 		normalized.startsWith('claude-opus-4');
@@ -284,19 +308,6 @@ export function buildContextManagement(
 }
 
 /**
- * Default values for context editing configuration.
- */
-export const CONTEXT_EDITING_DEFAULTS: ContextEditingConfig = {
-	triggerType: 'input_tokens',
-	triggerValue: 80000,
-	keepCount: 3,
-	clearAtLeastTokens: 10000,
-	excludeTools: [],
-	clearInputs: true,
-	thinkingKeepTurns: 1,
-};
-
-/**
  * Reads context editing configuration from settings and builds the context_management object.
  * This is a convenience function that combines reading configuration with buildContextManagement.
  * @param configurationService The configuration service to read settings from
@@ -309,18 +320,15 @@ export function getContextManagementFromConfig(
 ): ContextManagement | undefined {
 
 	const userConfig = configurationService.getConfig(ConfigKey.Advanced.AnthropicContextEditingConfig);
-	if (!userConfig) {
-		return buildContextManagement(CONTEXT_EDITING_DEFAULTS, thinkingEnabled);
-	}
 
 	const contextEditingConfig: ContextEditingConfig = {
-		triggerType: userConfig.triggerType ?? CONTEXT_EDITING_DEFAULTS.triggerType,
-		triggerValue: userConfig.triggerValue ?? CONTEXT_EDITING_DEFAULTS.triggerValue,
-		keepCount: userConfig.keepCount ?? CONTEXT_EDITING_DEFAULTS.keepCount,
-		clearAtLeastTokens: userConfig.clearAtLeastTokens ?? CONTEXT_EDITING_DEFAULTS.clearAtLeastTokens,
-		excludeTools: userConfig.excludeTools ?? CONTEXT_EDITING_DEFAULTS.excludeTools,
-		clearInputs: userConfig.clearInputs ?? CONTEXT_EDITING_DEFAULTS.clearInputs,
-		thinkingKeepTurns: userConfig.thinkingKeepTurns ?? CONTEXT_EDITING_DEFAULTS.thinkingKeepTurns,
+		triggerType: userConfig?.triggerType ?? 'input_tokens',
+		triggerValue: userConfig?.triggerValue ?? 100000,
+		keepCount: userConfig?.keepCount ?? 3,
+		clearAtLeastTokens: userConfig?.clearAtLeastTokens,
+		excludeTools: userConfig?.excludeTools ?? [],
+		clearInputs: userConfig?.clearInputs ?? false,
+		thinkingKeepTurns: userConfig?.thinkingKeepTurns ?? 1,
 	};
 
 	return buildContextManagement(contextEditingConfig, thinkingEnabled);

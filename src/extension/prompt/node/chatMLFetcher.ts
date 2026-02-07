@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Raw } from '@vscode/prompt-tsx';
+import type { OpenAI } from 'openai';
 import type { CancellationToken } from 'vscode';
 import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
 import { CopilotToken } from '../../../platform/authentication/common/copilotToken';
@@ -14,14 +15,15 @@ import { IConversationOptions } from '../../../platform/chat/common/conversation
 import { getTextPart, toTextParts } from '../../../platform/chat/common/globalStringUtils';
 import { IInteractionService } from '../../../platform/chat/common/interactionService';
 import { ConfigKey, HARD_TOOL_LIMIT, IConfigurationService } from '../../../platform/configuration/common/configurationService';
-import { isAnthropicToolSearchEnabled } from '../../../platform/networking/common/anthropic';
 import { ICAPIClientService } from '../../../platform/endpoint/common/capiClient';
 import { isAutoModel } from '../../../platform/endpoint/node/autoChatEndpoint';
+import { responseApiInputToRawMessagesForLogging } from '../../../platform/endpoint/node/responsesApi';
 import { collectSingleLineErrorMessage, ILogService } from '../../../platform/log/common/logService';
+import { isAnthropicToolSearchEnabled } from '../../../platform/networking/common/anthropic';
 import { FinishedCallback, getRequestId, IResponseDelta, OptionalChatRequestParams } from '../../../platform/networking/common/fetch';
 import { FetcherId, IFetcherService, Response } from '../../../platform/networking/common/fetcherService';
 import { IChatEndpoint, IEndpointBody, postRequest, stringifyUrlOrRequestMetadata } from '../../../platform/networking/common/networking';
-import { CAPIChatMessage, ChatCompletion, FilterReason, FinishedCompletionReason } from '../../../platform/networking/common/openai';
+import { CAPIChatMessage, ChatCompletion, FilterReason, FinishedCompletionReason, rawMessageToCAPI } from '../../../platform/networking/common/openai';
 import { sendEngineMessagesTelemetry } from '../../../platform/networking/node/chatStream';
 import { sendCommunicationErrorTelemetry } from '../../../platform/networking/node/stream';
 import { ChatFailKind, ChatRequestCanceled, ChatRequestFailed, ChatResults, FetchResponseKind } from '../../../platform/openai/node/fetch';
@@ -39,6 +41,7 @@ import { escapeRegExpCharacters } from '../../../util/vs/base/common/strings';
 import { generateUuid } from '../../../util/vs/base/common/uuid';
 import { isBYOKModel } from '../../byok/node/openAIEndpoint';
 import { EXTENSION_ID } from '../../common/constants';
+import { IPowerService } from '../../power/common/powerService';
 import { ChatMLFetcherTelemetrySender as Telemetry } from './chatMLFetcherTelemetry';
 
 export interface IMadeChatRequestEvent {
@@ -106,6 +109,7 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 		@IConversationOptions options: IConversationOptions,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 		@IExperimentationService private readonly _experimentationService: IExperimentationService,
+		@IPowerService private readonly _powerService: IPowerService,
 	) {
 		super(options);
 	}
@@ -156,7 +160,8 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 			location: opts.location,
 			body: requestBody,
 			ignoreStatefulMarker: opts.ignoreStatefulMarker,
-			isConversationRequest: opts.isConversationRequest
+			isConversationRequest: opts.isConversationRequest,
+			customMetadata: opts.customMetadata
 		});
 		let tokenCount = -1;
 		const streamRecorder = new FetchStreamRecorder(finishedCb);
@@ -559,6 +564,46 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 		useFetcher?: FetcherId,
 		canRetryOnce?: boolean,
 	): Promise<{ result: ChatResults | ChatRequestFailed | ChatRequestCanceled; fetcher?: FetcherId; bytesReceived?: number; statusCode?: number }> {
+		const isPowerSaveBlockerEnabled = this._configurationService.getExperimentBasedConfig(ConfigKey.TeamInternal.ChatRequestPowerSaveBlocker, this._experimentationService);
+		const blockerHandle = isPowerSaveBlockerEnabled && location !== ChatLocation.Other ? this._powerService.acquirePowerSaveBlocker() : undefined;
+		try {
+			return await this._doFetchAndStreamChat(
+				chatEndpointInfo,
+				request,
+				baseTelemetryData,
+				finishedCb,
+				secretKey,
+				copilotToken,
+				location,
+				ourRequestId,
+				nChoices,
+				cancellationToken,
+				userInitiatedRequest,
+				telemetryProperties,
+				useFetcher,
+				canRetryOnce,
+			);
+		} finally {
+			blockerHandle?.dispose();
+		}
+	}
+
+	private async _doFetchAndStreamChat(
+		chatEndpointInfo: IChatEndpoint,
+		request: IEndpointBody,
+		baseTelemetryData: TelemetryData,
+		finishedCb: FinishedCallback,
+		secretKey: string | undefined,
+		copilotToken: CopilotToken,
+		location: ChatLocation,
+		ourRequestId: string,
+		nChoices: number | undefined,
+		cancellationToken: CancellationToken,
+		userInitiatedRequest?: boolean,
+		telemetryProperties?: TelemetryProperties | undefined,
+		useFetcher?: FetcherId,
+		canRetryOnce?: boolean,
+	): Promise<{ result: ChatResults | ChatRequestFailed | ChatRequestCanceled; fetcher?: FetcherId; bytesReceived?: number; statusCode?: number }> {
 
 		if (cancellationToken.isCancellationRequested) {
 			return { result: { type: FetchResponseKind.Canceled, reason: 'before fetch request' } };
@@ -644,7 +689,8 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 				nChoices ?? /* OpenAI's default */ 1,
 				finishedCb,
 				extendedBaseTelemetryData,
-				cancellationToken
+				cancellationToken,
+				location,
 			);
 			chatCompletions = new AsyncIterableObject<ChatCompletion>(async emitter => {
 				try {
@@ -745,6 +791,7 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 			cancellationToken,
 			useFetcher,
 			canRetryOnce,
+			location,
 		).then(response => {
 			const apim = response.headers.get('apim-request-id');
 			if (apim) {
@@ -793,7 +840,20 @@ export class ChatMLFetcherImpl extends AbstractChatMLFetcher {
 				throw error;
 			})
 			.finally(() => {
-				sendEngineMessagesTelemetry(this._telemetryService, request.messages ?? [], telemetryData, false, this._logService);
+				let messagesToLog = request.messages;
+
+				// For Response API (has input but no messages), convert input to messages for logging
+				if ((!messagesToLog || messagesToLog.length === 0) && (request as OpenAI.Responses.ResponseCreateParams).input) {
+					try {
+						const rawMessages = responseApiInputToRawMessagesForLogging(request as OpenAI.Responses.ResponseCreateParams);
+						messagesToLog = rawMessageToCAPI(rawMessages);
+					} catch (e) {
+						this._logService.error(`Failed to convert Response API input to messages for telemetry:`, e);
+						messagesToLog = [];
+					}
+				}
+
+				sendEngineMessagesTelemetry(this._telemetryService, messagesToLog ?? [], telemetryData, false, this._logService);
 			});
 	}
 

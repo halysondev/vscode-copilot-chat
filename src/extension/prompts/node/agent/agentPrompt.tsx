@@ -3,10 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { BasePromptElementProps, Chunk, Image, PromptElement, PromptPiece, PromptPieceChild, PromptSizing, Raw, SystemMessage, TokenLimit, UserMessage } from '@vscode/prompt-tsx';
+import { BasePromptElementProps, Chunk, PromptElement, PromptPiece, PromptPieceChild, PromptSizing, Raw, SystemMessage, TokenLimit, UserMessage } from '@vscode/prompt-tsx';
 import type { ChatRequestEditedFileEvent, LanguageModelToolInformation, NotebookEditor, TaskDefinition, TextEditor } from 'vscode';
 import { ChatLocation } from '../../../../platform/chat/common/commonTypes';
 import { ConfigKey, IConfigurationService } from '../../../../platform/configuration/common/configurationService';
+import { ICustomInstructionsService } from '../../../../platform/customInstructions/common/customInstructionsService';
+import { USE_SKILL_ADHERENCE_PROMPT_SETTING } from '../../../../platform/customInstructions/common/promptTypes';
 import { CacheType } from '../../../../platform/endpoint/common/endpointTypes';
 import { IEnvService, OperatingSystem } from '../../../../platform/env/common/envService';
 import { ILogService } from '../../../../platform/log/common/logService';
@@ -17,21 +19,23 @@ import { ITabsAndEditorsService } from '../../../../platform/tabs/common/tabsAnd
 import { ITasksService } from '../../../../platform/tasks/common/tasksService';
 import { IExperimentationService } from '../../../../platform/telemetry/common/nullExperimentationService';
 import { IWorkspaceService } from '../../../../platform/workspace/common/workspaceService';
-import { isDefined } from '../../../../util/vs/base/common/types';
+import { isDefined, isString } from '../../../../util/vs/base/common/types';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
 import { ChatRequestEditedFileEventKind, Position, Range } from '../../../../vscodeTypes';
 import { GenericBasePromptElementProps } from '../../../context/node/resolvers/genericPanelIntentInvocation';
-import { ChatVariablesCollection } from '../../../prompt/common/chatVariablesCollection';
+import { ChatVariablesCollection, isPromptInstructionText } from '../../../prompt/common/chatVariablesCollection';
 import { getGlobalContextCacheKey, GlobalContextMessageMetadata, RenderedUserMessageMetadata, Turn } from '../../../prompt/common/conversation';
 import { InternalToolReference } from '../../../prompt/common/intents';
 import { IPromptVariablesService } from '../../../prompt/node/promptVariablesService';
 import { ToolName } from '../../../tools/common/toolNames';
+import { RepoMemoryContextPrompt, RepoMemoryInstructionsPrompt } from '../../../tools/node/repoMemoryContextPrompt';
 import { TodoListContextPrompt } from '../../../tools/node/todoListContextPrompt';
 import { IPromptEndpoint, renderPromptElement } from '../base/promptRenderer';
 import { Tag } from '../base/tag';
 import { TerminalStatePromptElement } from '../base/terminalState';
 import { ChatVariables, UserQuery } from '../panel/chatVariables';
 import { CustomInstructions } from '../panel/customInstructions';
+import { HistoricalImage } from '../panel/image';
 import { NotebookFormat, NotebookReminderInstructions } from '../panel/notebookEditCodePrompt';
 import { NotebookSummaryChange } from '../panel/notebookSummaryChangePrompt';
 import { UserPreferences } from '../panel/preferences';
@@ -100,6 +104,9 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 				<SafetyRules />
 			</SystemMessage>
 			{instructions}
+			<SystemMessage>
+				<RepoMemoryInstructionsPrompt />
+			</SystemMessage>
 		</>;
 		const baseInstructions = <>
 			{!omitBaseAgentInstructions && baseAgentInstructions}
@@ -111,7 +118,6 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 
 		const maxToolResultLength = Math.floor(this.promptEndpoint.modelMaxPromptTokens * MAX_TOOL_RESPONSE_PCT);
 		const userQueryTagName = customizations.userQueryTagName;
-		const attachmentHint = customizations.attachmentHint;
 		const ReminderInstructionsClass = customizations.ReminderInstructionsClass;
 		const ToolReferencesHintClass = customizations.ToolReferencesHintClass;
 
@@ -129,7 +135,6 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 					tools={this.props.promptContext.tools?.availableTools}
 					enableCacheBreakpoints={this.props.enableCacheBreakpoints}
 					userQueryTagName={userQueryTagName}
-					attachmentHint={attachmentHint}
 					ReminderInstructionsClass={ReminderInstructionsClass}
 					ToolReferencesHintClass={ToolReferencesHintClass}
 				/>
@@ -138,7 +143,7 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 			return <>
 				{baseInstructions}
 				<AgentConversationHistory flexGrow={1} priority={700} promptContext={this.props.promptContext} />
-				<AgentUserMessage flexGrow={2} priority={900} {...getUserMessagePropsFromAgentProps(this.props, { userQueryTagName, attachmentHint, ReminderInstructionsClass, ToolReferencesHintClass })} />
+				<AgentUserMessage flexGrow={2} priority={900} {...getUserMessagePropsFromAgentProps(this.props, { userQueryTagName, ReminderInstructionsClass, ToolReferencesHintClass })} />
 				<ChatToolCalls priority={899} flexGrow={2} promptContext={this.props.promptContext} toolCallRounds={this.props.promptContext.toolCallRounds} toolCallResults={this.props.promptContext.toolCallResults} truncateAt={maxToolResultLength} enableCacheBreakpoints={false} />
 			</>;
 		}
@@ -146,14 +151,12 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 
 	private async getSystemPrompt(customizations: AgentPromptCustomizations) {
 		const modelFamily = this.props.endpoint.family ?? 'unknown';
-		const isNewChat = this.props.promptContext.history?.length === 1;
 
 		if (this.props.endpoint.family.startsWith('gpt-') && this.configurationService.getExperimentBasedConfig(ConfigKey.EnableAlternateGptPrompt, this.experimentationService)) {
 			return <AlternateGPTPrompt
 				availableTools={this.props.promptContext.tools?.availableTools}
 				modelFamily={this.props.endpoint.family}
 				codesearchMode={this.props.codesearchMode}
-				isNewChat={isNewChat}
 			/>;
 		}
 
@@ -162,7 +165,6 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 			availableTools={this.props.promptContext.tools?.availableTools}
 			modelFamily={modelFamily}
 			codesearchMode={this.props.codesearchMode}
-			isNewChat={isNewChat}
 		/>;
 	}
 
@@ -196,9 +198,10 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 
 	private async getOrCreateGlobalAgentContext(endpoint: IChatEndpoint): Promise<PromptPieceChild[]> {
 		const globalContext = await this.getOrCreateGlobalAgentContextContent(endpoint);
+		const isNewChat = this.props.promptContext.history?.length === 0;
 		return globalContext ?
 			renderedMessageToTsxChildren(globalContext, !!this.props.enableCacheBreakpoints) :
-			<GlobalAgentContext enableCacheBreakpoints={!!this.props.enableCacheBreakpoints} availableTools={this.props.promptContext.tools?.availableTools} />;
+			<GlobalAgentContext enableCacheBreakpoints={!!this.props.enableCacheBreakpoints} availableTools={this.props.promptContext.tools?.availableTools} isNewChat={isNewChat} />;
 	}
 
 	private async getOrCreateGlobalAgentContextContent(endpoint: IChatEndpoint): Promise<Raw.ChatCompletionContentPart[] | undefined> {
@@ -213,7 +216,8 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 			}
 		}
 
-		const rendered = await renderPromptElement(this.instantiationService, endpoint, GlobalAgentContext, { enableCacheBreakpoints: this.props.enableCacheBreakpoints, availableTools: this.props.promptContext.tools?.availableTools }, undefined, undefined);
+		const isNewChat = this.props.promptContext.history?.length === 0;
+		const rendered = await renderPromptElement(this.instantiationService, endpoint, GlobalAgentContext, { enableCacheBreakpoints: this.props.enableCacheBreakpoints, availableTools: this.props.promptContext.tools?.availableTools, isNewChat }, undefined, undefined);
 		const msg = rendered.messages.at(0)?.content;
 		if (msg) {
 			firstTurn?.setMetadata(new GlobalContextMessageMetadata(msg, this.instantiationService.invokeFunction(getGlobalContextCacheKey)));
@@ -225,6 +229,7 @@ export class AgentPrompt extends PromptElement<AgentPromptProps> {
 interface GlobalAgentContextProps extends BasePromptElementProps {
 	readonly enableCacheBreakpoints?: boolean;
 	readonly availableTools?: readonly LanguageModelToolInformation[];
+	readonly isNewChat?: boolean;
 }
 
 /**
@@ -245,6 +250,7 @@ class GlobalAgentContext extends PromptElement<GlobalAgentContextProps> {
 				<AgentMultirootWorkspaceStructure maxSize={2000} excludeDotFiles={true} availableTools={this.props.availableTools} />
 			</Tag>
 			<UserPreferences flexGrow={7} priority={800} />
+			{this.props.isNewChat && <RepoMemoryContextPrompt />}
 			{this.props.enableCacheBreakpoints && <cacheBreakpoint type={CacheType} />}
 		</UserMessage>;
 	}
@@ -253,8 +259,6 @@ class GlobalAgentContext extends PromptElement<GlobalAgentContextProps> {
 export interface AgentUserMessageCustomizations {
 	/** Tag name used to wrap the user query (e.g., 'userRequest' or 'user_query') */
 	readonly userQueryTagName?: string;
-	/** Hint text appended to user query when there are attachments */
-	readonly attachmentHint?: string;
 	/** Custom reminder instructions component class */
 	readonly ReminderInstructionsClass?: ReminderInstructionsConstructor;
 	/** Custom tool references hint component class */
@@ -273,6 +277,10 @@ export interface AgentUserMessageProps extends BasePromptElementProps, AgentUser
 	readonly editedFileEvents?: readonly ChatRequestEditedFileEvent[];
 	readonly sessionId?: string;
 	readonly sessionResource?: string;
+	/** When true, indicates this is a stop hook continuation where the stop hook query is rendered as a separate message. */
+	readonly hasStopHookQuery?: boolean;
+	/** Additional context provided by SubagentStart hooks. */
+	readonly additionalHookContext?: string;
 }
 
 export function getUserMessagePropsFromTurn(turn: Turn, endpoint: IChatEndpoint, customizations?: AgentUserMessageCustomizations): AgentUserMessageProps {
@@ -300,6 +308,8 @@ export function getUserMessagePropsFromAgentProps(agentProps: AgentPromptProps, 
 		chatVariables: agentProps.promptContext.chatVariables,
 		enableCacheBreakpoints: agentProps.enableCacheBreakpoints,
 		editedFileEvents: agentProps.promptContext.editedFileEvents,
+		hasStopHookQuery: agentProps.promptContext.hasStopHookQuery,
+		additionalHookContext: agentProps.promptContext.additionalHookContext,
 		// TODO:@roblourens
 		sessionId: (agentProps.promptContext.tools?.toolInvocationToken as any)?.sessionId,
 		sessionResource: (agentProps.promptContext.tools?.toolInvocationToken as any)?.sessionResource,
@@ -315,7 +325,8 @@ export class AgentUserMessage extends PromptElement<AgentUserMessageProps> {
 	constructor(
 		props: AgentUserMessageProps,
 		@IPromptVariablesService private readonly promptVariablesService: IPromptVariablesService,
-		@ILogService private readonly logService: ILogService
+		@ILogService private readonly logService: ILogService,
+		@IConfigurationService private readonly configurationService: IConfigurationService
 	) {
 		super(props);
 	}
@@ -342,7 +353,6 @@ export class AgentUserMessage extends PromptElement<AgentUserMessageProps> {
 		const hasTodoTool = !!this.props.availableTools?.find(tool => tool.name === ToolName.CoreManageTodoList);
 
 		const userQueryTagName = this.props.userQueryTagName ?? 'userRequest';
-		const attachmentHint = this.props.chatVariables.hasVariables() ? (this.props.attachmentHint ?? '') : '';
 		const ReminderInstructionsClass = this.props.ReminderInstructionsClass ?? DefaultReminderInstructions;
 		const reminderProps: ReminderInstructionsProps = {
 			endpoint: this.props.endpoint,
@@ -370,15 +380,17 @@ export class AgentUserMessage extends PromptElement<AgentUserMessageProps> {
 						<NotebookSummaryChange />
 						{hasTerminalTool && <TerminalStatePromptElement sessionId={this.props.sessionId} />}
 						{hasTodoTool && <TodoListContextPrompt sessionResource={this.props.sessionResource} />}
+						{this.props.additionalHookContext && <AdditionalHookContextPrompt context={this.props.additionalHookContext} />}
 					</Tag>
 					<CurrentEditorContext endpoint={this.props.endpoint} />
 					<Tag name='reminderInstructions'>
 						{/* Critical reminders that are effective when repeated right next to the user message */}
 						<ReminderInstructionsClass {...reminderProps} />
 						<NotebookReminderInstructions chatVariables={this.props.chatVariables} query={this.props.request} />
+						{this.configurationService.getNonExtensionConfig<boolean>(USE_SKILL_ADHERENCE_PROMPT_SETTING) && <SkillAdherenceReminder chatVariables={this.props.chatVariables} />}
 					</Tag>
 					{query && <Tag name={userQueryTagName} priority={900} flexGrow={7}>
-						<UserQuery chatVariables={this.props.chatVariables} query={query + attachmentHint} />
+						<UserQuery chatVariables={this.props.chatVariables} query={query} />
 					</Tag>}
 					{this.props.enableCacheBreakpoints && <cacheBreakpoint type={CacheType} />}
 				</UserMessage>
@@ -413,7 +425,7 @@ export function renderedMessageToTsxChildren(message: string | readonly Raw.Chat
 		if (part.type === Raw.ChatCompletionContentPartKind.Text) {
 			return part.text;
 		} else if (part.type === Raw.ChatCompletionContentPartKind.Image) {
-			return <Image src={part.imageUrl.url} detail={part.imageUrl.detail} mimeType={part.imageUrl.mediaType} />;
+			return <HistoricalImage src={part.imageUrl.url} detail={part.imageUrl.detail} mimeType={part.imageUrl.mediaType} />;
 		} else if (part.type === Raw.ChatCompletionContentPartKind.CacheBreakpoint) {
 			return enableCacheBreakpoints && <cacheBreakpoint type={CacheType} />;
 		}
@@ -446,6 +458,54 @@ class CurrentDatePrompt extends PromptElement<BasePromptElementProps> {
 		return (
 			!this.envService.isSimulation() && <>The current date is {dateStr}.</>
 		);
+	}
+}
+
+interface AdditionalHookContextPromptProps extends BasePromptElementProps {
+	readonly context: string;
+}
+
+/**
+ * Renders additional context provided by hooks.
+ */
+class AdditionalHookContextPrompt extends PromptElement<AdditionalHookContextPromptProps> {
+	async render(state: void, sizing: PromptSizing) {
+		return <>Additional instructions from hooks: {this.props.context}</>;
+	}
+}
+
+interface SkillAdherenceReminderProps extends BasePromptElementProps {
+	readonly chatVariables: ChatVariablesCollection;
+}
+
+/**
+ * Skill adherence reminder that prompts the model to read SKILL.md files when skills are available
+ * in the instruction index.
+ * Shown whenever the instruction index variable contains at least one skill or skill folder entry.
+ */
+class SkillAdherenceReminder extends PromptElement<SkillAdherenceReminderProps> {
+	constructor(
+		props: SkillAdherenceReminderProps,
+		@ICustomInstructionsService private readonly customInstructionsService: ICustomInstructionsService,
+	) {
+		super(props);
+	}
+
+	async render() {
+		// Check if any skills are available from the instruction index
+		const indexVariable = this.props.chatVariables.find(isPromptInstructionText);
+		if (!indexVariable || !isString(indexVariable.value)) {
+			return undefined;
+		}
+
+		const indexFile = this.customInstructionsService.parseInstructionIndexFile(indexVariable.value);
+		if (indexFile.skills.size === 0) {
+			return undefined;
+		}
+
+		return <Tag name='additional_skills_reminder'>
+			Always check if any skills apply to the user's request. If so, use the {ToolName.ReadFile} tool to read the corresponding SKILL.md files. Multiple skill files may be needed for a single request. These files contain best practices built from testing that are needed for high-quality outputs.<br />
+		</Tag>;
 	}
 }
 

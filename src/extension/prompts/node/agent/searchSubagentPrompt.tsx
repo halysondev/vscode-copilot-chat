@@ -4,18 +4,20 @@
  *--------------------------------------------------------------------------------------------*/
 
 
-import { AssistantMessage, PromptElement, PromptSizing, SystemMessage, UserMessage } from '@vscode/prompt-tsx';
+import { PromptElement, PromptSizing, SystemMessage, UserMessage } from '@vscode/prompt-tsx';
 import { GenericBasePromptElementProps } from '../../../context/node/resolvers/genericPanelIntentInvocation';
 import { CopilotToolMode } from '../../../tools/common/toolsRegistry';
 import { ChatToolCalls } from '../panel/toolCalling';
 
-const MAX_SEARCH_TURNS = 4;
+export interface SearchSubagentPromptProps extends GenericBasePromptElementProps {
+	readonly maxSearchTurns: number;
+}
 
 /**
  * Prompt for the search subagent that uses custom search instructions
  * instead of the default agent system prompt.
  */
-export class SearchSubagentPrompt extends PromptElement<GenericBasePromptElementProps> {
+export class SearchSubagentPrompt extends PromptElement<SearchSubagentPromptProps> {
 	async render(state: void, sizing: PromptSizing) {
 		const { conversation, toolCallRounds, toolCallResults } = this.props.promptContext;
 
@@ -24,7 +26,7 @@ export class SearchSubagentPrompt extends PromptElement<GenericBasePromptElement
 
 		// Check if we're at the last turn (to align with training where we coax final answer)
 		const currentTurn = toolCallRounds?.length ?? 0;
-		const isLastTurn = currentTurn >= MAX_SEARCH_TURNS - 1;
+		const isLastTurn = currentTurn >= this.props.maxSearchTurns - 1;
 
 		return (
 			<>
@@ -50,9 +52,9 @@ export class SearchSubagentPrompt extends PromptElement<GenericBasePromptElement
 					toolCallMode={CopilotToolMode.FullContext}
 				/>
 				{isLastTurn && (
-					<AssistantMessage priority={898}>
-						OK, my allotted iterations are finished -- I must produce a list of code references as the final answer. &lt;final_answer&gt;
-					</AssistantMessage>
+					<UserMessage priority={900}>
+						OK, your allotted iterations are finished -- you must produce a list of code references as the final answer, starting and ending with &lt;final_answer&gt;.
+					</UserMessage>
 				)}
 			</>
 		);

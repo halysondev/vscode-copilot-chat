@@ -120,14 +120,16 @@ All interactions are displayed through VS Code's native chat UI, providing a sea
 - Provides dependency injection for testability
 - Enables mocking in unit tests
 
-### `node/claudeCodeSessionService.ts`
+### `node/sessionParser/claudeCodeSessionService.ts`
 
 **IClaudeCodeSessionService / ClaudeCodeSessionService**
 - Loads and manages persisted Claude Code sessions from disk
 - Reads `.jsonl` session files from `~/.claude/projects/<workspace-slug>/`
 - Builds message chains from leaf nodes to reconstruct full conversations
+- Discovers and parses subagent sessions from `{session-id}/subagents/agent-*.jsonl`
 - Provides session caching with mtime-based invalidation
 - Used to resume previous Claude Code conversations
+- See `node/sessionParser/README.md` for detailed documentation
 
 ### `common/claudeTools.ts`
 
@@ -168,6 +170,52 @@ Claude Code sessions are persisted to `~/.claude/projects/<workspace-slug>/` as 
 - Load all sessions for the current workspace
 - Resume a previous session by ID
 - Cache sessions with mtime-based invalidation
+
+## Folder and Working Directory Management
+
+The integration deterministically resolves the working directory (`cwd`) and additional directories for each Claude session, rather than inheriting from `process.cwd()`. This is managed by the `ClaudeChatSessionContentProvider` and exposed through the `ClaudeFolderInfo` interface.
+
+### `ClaudeFolderInfo` (`common/claudeFolderInfo.ts`)
+
+```typescript
+interface ClaudeFolderInfo {
+  readonly cwd: string;                  // Primary working directory
+  readonly additionalDirectories: string[]; // Extra directories Claude can access
+}
+```
+
+### Folder Resolution by Workspace Type
+
+| Workspace Type | cwd | additionalDirectories | Folder Picker |
+|---|---|---|---|
+| **Single-root** (1 folder) | That folder | `[]` | Hidden |
+| **Multi-root** (2+ folders) | Selected folder (default: first) | All other workspace folders | Shown with workspace folders |
+| **Empty** (0 folders) | Selected MRU folder | `[]` | Shown with MRU entries |
+
+### Data Flow
+
+1. **`ClaudeChatSessionContentProvider`** resolves `ClaudeFolderInfo` via `getFolderInfoForSession(sessionId)`
+2. The folder info is passed through `ClaudeAgentManager.handleRequest()` to `ClaudeCodeSession`
+3. `ClaudeCodeSession._startSession()` uses `folderInfo.cwd` and `folderInfo.additionalDirectories` when building SDK `Options`
+
+### Folder Picker UI
+
+In multi-root and empty workspaces, a folder picker option appears in the chat session options:
+- **Multi-root**: Lists all workspace folders; selecting one makes it `cwd`, the rest become `additionalDirectories`
+- **Empty workspace**: Lists MRU folders from `IFolderRepositoryManager` (max 10 entries)
+- The folder option is **locked** for existing (non-untitled) sessions to prevent cwd changes mid-conversation
+
+### Session Discovery Across Folders
+
+`ClaudeCodeSessionService._getProjectSlugs()` generates workspace slugs for **all** workspace folders, enabling session discovery across all project directories in multi-root workspaces. For empty workspaces, it generates slugs for all folders known to `IFolderRepositoryManager` (MRU entries).
+
+### Key Files
+
+- **`common/claudeFolderInfo.ts`**: `ClaudeFolderInfo` interface
+- **`../../chatSessions/vscode-node/claudeChatSessionContentProvider.ts`**: Folder resolution, picker options, and handler integration
+- **`../../chatSessions/vscode-node/folderRepositoryManagerImpl.ts`**: `FolderRepositoryManager` (abstract base) with `ClaudeFolderRepositoryManager` subclass — the Claude subclass does not depend on `ICopilotCLISessionService` (CopilotCLI has its own subclass `CopilotCLIFolderRepositoryManager`)
+- **`node/claudeCodeAgent.ts`**: Consumes `ClaudeFolderInfo` in `ClaudeCodeSession._startSession()`
+- **`node/sessionParser/claudeCodeSessionService.ts`**: `_getProjectSlugs()` generates slugs for all folders
 
 ## Testing
 
@@ -242,8 +290,10 @@ Slash commands often need to present choices or gather input from users. When do
 The `show*` APIs are sufficient for most slash command use cases and result in cleaner, more maintainable code. Only use `create*` APIs when you need advanced features like dynamic item updates, multi-step wizards, or custom event handling.
 
 **Current Slash Commands:**
-- `/hooks` - Display information about registered hooks (from `hooksCommand.ts`)
-- `/memory` - Memory management commands (from `memoryCommand.ts`)
+- `/hooks` - Configure Claude Agent hooks for tool execution and events (from `hooksCommand.ts`)
+- `/memory` - Open memory files (CLAUDE.md) for editing (from `memoryCommand.ts`)
+- `/agents` - Create and manage specialized Claude agents (from `agentsCommand.ts`)
+- `/terminal` - Create a terminal with Claude CLI configured to use Copilot Chat endpoints (from `terminalCommand.ts`) _Temporarily disabled pending legal review_
 
 ### Tool Permission Handlers
 
@@ -260,7 +310,7 @@ Tool permission handlers control what actions Claude can take without user confi
 - **Common handlers** (`common/toolPermissionHandlers/`):
   - `bashToolHandler.ts` - Controls bash/shell command execution
   - `exitPlanModeHandler.ts` - Manages plan mode transitions
-  
+
 - **Node handlers** (`node/toolPermissionHandlers/`):
   - `editToolHandler.ts` - Handles file edit operations (Edit, Write, MultiEdit)
 
@@ -303,6 +353,18 @@ To add new functionality:
 
 The integration respects VS Code settings:
 - `github.copilot.advanced.claudeCodeDebugEnabled`: Enables debug logging from Claude Code SDK
+
+## Upgrading Anthropic SDK Packages
+
+For the complete upgrade process, use the **anthropic-sdk-upgrader** Claude Code agent. The agent provides step-by-step guidance for upgrading `@anthropic-ai/claude-agent-sdk` and `@anthropic-ai/sdk` packages, including:
+
+- Checking changelogs and summarizing changes
+- Categorizing changes by impact level
+- Fixing compilation errors in key files
+- Complete testing checklist
+- Troubleshooting common issues
+
+See `.claude/agents/anthropic-sdk-upgrader.md` for the full process.
 
 ## Dependencies
 

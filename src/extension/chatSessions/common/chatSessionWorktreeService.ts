@@ -7,6 +7,16 @@ import type * as vscode from 'vscode';
 import { RepoContext } from '../../../platform/git/common/gitService';
 import { createServiceIdentifier } from '../../../util/common/services';
 
+export interface ChatSessionWorktreeFile {
+	readonly filePath: string;
+	readonly originalFilePath: string | undefined;
+	readonly modifiedFilePath: string | undefined;
+	readonly statistics: {
+		readonly additions: number;
+		readonly deletions: number;
+	};
+}
+
 export interface ChatSessionWorktreeData {
 	readonly data: string;
 	readonly version: number;
@@ -18,6 +28,7 @@ interface ChatSessionWorktreePropertiesV1 {
 	readonly branchName: string;
 	readonly repositoryPath: string;
 	readonly worktreePath: string;
+	readonly changes?: readonly ChatSessionWorktreeFile[] | undefined;
 }
 
 export type ChatSessionWorktreeProperties = ChatSessionWorktreePropertiesV1;
@@ -27,11 +38,7 @@ export const IChatSessionWorktreeService = createServiceIdentifier<IChatSessionW
 export interface IChatSessionWorktreeService {
 	readonly _serviceBrand: undefined;
 
-	getSessionRepository(sessionId: string): RepoContext | undefined;
-	setSessionRepository(sessionId: string, repositoryPath: string): Promise<void>;
-	deleteSessionRepository(sessionId: string): Promise<void>;
-
-	createWorktree(sessionId: string | undefined, stream?: vscode.ChatResponseStream): Promise<ChatSessionWorktreeProperties | undefined>;
+	createWorktree(repositoryPath: vscode.Uri, stream?: vscode.ChatResponseStream): Promise<ChatSessionWorktreeProperties | undefined>;
 
 	getWorktreeProperties(sessionId: string): ChatSessionWorktreeProperties | undefined;
 	setWorktreeProperties(sessionId: string, properties: string | ChatSessionWorktreeProperties): Promise<void>;
@@ -40,7 +47,7 @@ export interface IChatSessionWorktreeService {
 	getWorktreePath(sessionId: string): vscode.Uri | undefined;
 
 	applyWorktreeChanges(sessionId: string): Promise<void>;
-	getWorktreeChanges(sessionId: string): Promise<vscode.ChatSessionChangedFile2[] | undefined>;
+	getWorktreeChanges(sessionId: string): Promise<readonly ChatSessionWorktreeFile[] | undefined>;
 
 	handleRequestCompleted(sessionId: string): Promise<void>;
 }

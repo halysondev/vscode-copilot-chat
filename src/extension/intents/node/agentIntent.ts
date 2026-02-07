@@ -88,7 +88,11 @@ export const getAgentTools = async (accessor: ServicesAccessor, request: vscode.
 
 	allowTools[ToolName.CoreRunTest] = await testService.hasAnyTests();
 	allowTools[ToolName.CoreRunTask] = tasksService.getTasks().length > 0;
-	allowTools[ToolName.SearchSubagent] = (isGptFamily(model) || isAnthropicFamily(model)) && configurationService.getExperimentBasedConfig(ConfigKey.Advanced.SearchSubagentToolEnabled, experimentationService);
+
+	const useAgenticProxy = configurationService.getConfig(ConfigKey.Advanced.SearchSubagentUseAgenticProxy);
+	const searchSubagentEnabled = configurationService.getExperimentBasedConfig(ConfigKey.Advanced.SearchSubagentToolEnabled, experimentationService);
+	const isGptOrAnthropic = isGptFamily(model) || isAnthropicFamily(model);
+	allowTools[ToolName.SearchSubagent] = isGptOrAnthropic && (useAgenticProxy && searchSubagentEnabled);
 
 	if (model.family.includes('grok-code')) {
 		allowTools[ToolName.CoreManageTodoList] = false;
@@ -221,7 +225,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 			this.configurationService.getConfig<number | undefined>(ConfigKey.Advanced.SummarizeAgentConversationHistoryThreshold) ?? this.endpoint.modelMaxPromptTokens,
 			this.endpoint.modelMaxPromptTokens
 		);
-		const useTruncation = this.configurationService.getConfig(ConfigKey.Advanced.UseResponsesApiTruncation);
+		const useTruncation = this.endpoint.apiType === 'responses' && this.configurationService.getConfig(ConfigKey.Advanced.UseResponsesApiTruncation);
 		const summarizationEnabled = this.configurationService.getConfig(ConfigKey.SummarizeAgentConversationHistory) && this.prompt === AgentPrompt;
 
 		// For Anthropic models with context editing, check previous turn's token usage to determine budget
@@ -232,7 +236,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		let shouldTriggerSummarize = false;
 		const budgetThreshold = Math.floor((baseBudget - toolTokens) * 0.85);
 
-		const anthropicContextEditingEnabled = isAnthropicFamily(this.endpoint) && isAnthropicContextEditingEnabled(this.endpoint, this.configurationService, this.expService);
+		const anthropicContextEditingEnabled = isAnthropicContextEditingEnabled(this.endpoint, this.configurationService, this.expService);
 		if (summarizationEnabled && anthropicContextEditingEnabled) {
 			// First check current turn for token usage (from tool calling loop), then fall back to previous turn's result metadata
 			const currentTurn = promptContext.conversation?.getLatestTurn();

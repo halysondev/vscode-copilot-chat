@@ -10,16 +10,31 @@ import { AsyncIterableObject } from '../../../util/vs/base/common/async';
 import { SSEParser } from '../../../util/vs/base/common/sseParser';
 import { generateUuid } from '../../../util/vs/base/common/uuid';
 import { IInstantiationService, ServicesAccessor } from '../../../util/vs/platform/instantiation/common/instantiation';
+import { ChatLocation } from '../../chat/common/commonTypes';
 import { ConfigKey, IConfigurationService } from '../../configuration/common/configurationService';
 import { ILogService } from '../../log/common/logService';
 import { AnthropicMessagesTool, ContextManagementResponse, getContextManagementFromConfig, isAnthropicContextEditingEnabled, isAnthropicToolSearchEnabled, nonDeferredToolNames, ServerToolUse, TOOL_SEARCH_TOOL_NAME, TOOL_SEARCH_TOOL_TYPE, ToolSearchToolResult } from '../../networking/common/anthropic';
-import { FinishedCallback, IResponseDelta } from '../../networking/common/fetch';
+import { FinishedCallback, IIPCodeCitation, IResponseDelta } from '../../networking/common/fetch';
 import { IChatEndpoint, ICreateEndpointBodyOptions, IEndpointBody } from '../../networking/common/networking';
 import { ChatCompletion, FinishedCompletionReason, rawMessageToCAPI } from '../../networking/common/openai';
 import { sendEngineMessagesTelemetry } from '../../networking/node/chatStream';
 import { IExperimentationService } from '../../telemetry/common/nullExperimentationService';
 import { ITelemetryService } from '../../telemetry/common/telemetry';
 import { TelemetryData } from '../../telemetry/common/telemetryData';
+
+/** IP Code Citation annotation from Messages API copilot_annotations */
+interface AnthropicIPCodeCitation {
+	id: number;
+	start_offset: number;
+	end_offset: number;
+	details: Record<string, unknown>;
+	citations: {
+		snippet: string;
+		url: string;
+		ip_type?: string;
+		license: string;
+	};
+}
 
 interface AnthropicStreamEvent {
 	type: string;
@@ -52,6 +67,9 @@ interface AnthropicStreamEvent {
 		stop_reason?: string;
 		stop_sequence?: string;
 	};
+	copilot_annotations?: {
+		IPCodeCitations?: AnthropicIPCodeCitation[];
+	};
 	usage?: {
 		output_tokens: number;
 		input_tokens?: number;
@@ -69,6 +87,9 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 	const experimentationService = accessor.get(IExperimentationService);
 
 	const toolSearchEnabled = isAnthropicToolSearchEnabled(endpoint, configurationService, experimentationService);
+	const isAllowedConversationAgent = options.location === ChatLocation.Agent || options.location === ChatLocation.MessagesProxy;
+	// TODO: Use a dedicated flag on options instead of relying on telemetry subType
+	const isSubagent = options.telemetryProperties?.subType?.startsWith('subagent') ?? false;
 
 	const anthropicTools = options.requestOptions?.tools
 		?.filter(tool => tool.function.name && tool.function.name.length > 0)
@@ -80,13 +101,12 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 				properties: (tool.function.parameters as { properties?: Record<string, unknown> })?.properties ?? {},
 				required: (tool.function.parameters as { required?: string[] })?.required ?? [],
 			},
-			// Mark tools for deferred loading when tool search is enabled, except for frequently used tools
-			...(toolSearchEnabled && !nonDeferredToolNames.has(tool.function.name) ? { defer_loading: true } : {}),
+			// Mark tools for deferred loading when tool search is enabled for allowed conversation agents, except for frequently used tools
+			...(toolSearchEnabled && isAllowedConversationAgent && !isSubagent && !nonDeferredToolNames.has(tool.function.name) ? { defer_loading: true } : {}),
 		}));
-
 	// Build final tools array, adding tool search tool if enabled
 	const finalTools: AnthropicMessagesTool[] = [];
-	if (toolSearchEnabled) {
+	if (isAllowedConversationAgent && !isSubagent && toolSearchEnabled) {
 		finalTools.push({ name: TOOL_SEARCH_TOOL_NAME, type: TOOL_SEARCH_TOOL_TYPE, defer_loading: false });
 	}
 
@@ -95,21 +115,38 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 	}
 
 	// Don't enable thinking if explicitly disabled (e.g., continuation without thinking in history)
-	let thinkingBudget: number | undefined;
-	if (!options.disableThinking) {
-		const configuredBudget = configurationService.getExperimentBasedConfig(ConfigKey.AnthropicThinkingBudget, experimentationService);
-		const maxTokens = options.postOptions.max_tokens ?? 1024;
-		const normalizedBudget = (configuredBudget && configuredBudget > 0)
-			? (configuredBudget < 1024 ? 1024 : configuredBudget)
-			: undefined;
-		thinkingBudget = normalizedBudget
-			? Math.min(32000, maxTokens - 1, normalizedBudget)
-			: undefined;
+	// or if the location is not the chat panel (conversation agent)
+	// or if the model doesn't support thinking
+	let thinkingConfig: { type: 'enabled' | 'adaptive'; budget_tokens?: number } | undefined;
+	if (isAllowedConversationAgent && !options.disableThinking) {
+		if (endpoint.supportsAdaptiveThinking) {
+			thinkingConfig = { type: 'adaptive' };
+		} else if (endpoint.maxThinkingBudget && endpoint.minThinkingBudget) {
+			const configuredBudget = configurationService.getExperimentBasedConfig(ConfigKey.AnthropicThinkingBudget, experimentationService);
+			const maxTokens = options.postOptions.max_tokens ?? 1024;
+			const minBudget = endpoint.minThinkingBudget ?? 1024;
+			const normalizedBudget = (configuredBudget && configuredBudget > 0)
+				? (configuredBudget < minBudget ? minBudget : configuredBudget)
+				: undefined;
+			const thinkingBudget = normalizedBudget
+				? Math.min(maxTokens - 1, normalizedBudget)
+				: undefined;
+			if (thinkingBudget) {
+				thinkingConfig = { type: 'enabled', budget_tokens: thinkingBudget };
+			}
+		}
 	}
 
+	const thinkingEnabled = !!thinkingConfig;
+
+	// Build output config with effort level for adaptive thinking
+	const effort = endpoint.supportsAdaptiveThinking
+		? configurationService.getConfig(ConfigKey.AnthropicThinkingEffort)
+		: undefined;
+
 	// Build context management configuration
-	const contextManagement = isAnthropicContextEditingEnabled(endpoint, configurationService, experimentationService)
-		? getContextManagementFromConfig(configurationService, (thinkingBudget ?? 0) > 0)
+	const contextManagement = isAllowedConversationAgent && !isSubagent && isAnthropicContextEditingEnabled(endpoint, configurationService, experimentationService)
+		? getContextManagementFromConfig(configurationService, thinkingEnabled)
 		: undefined;
 
 	return {
@@ -119,10 +156,8 @@ export function createMessagesRequestBody(accessor: ServicesAccessor, options: I
 		tools: finalTools.length > 0 ? finalTools : undefined,
 		top_p: options.postOptions.top_p,
 		max_tokens: options.postOptions.max_tokens,
-		thinking: thinkingBudget ? {
-			type: 'enabled',
-			budget_tokens: thinkingBudget,
-		} : undefined,
+		thinking: thinkingConfig,
+		...(effort ? { output_config: { effort } } : {}),
 		...(contextManagement ? { context_management: contextManagement } : {}),
 	};
 }
@@ -370,7 +405,59 @@ export class AnthropicMessagesProcessor {
 		private readonly requestId: string,
 		private readonly ghRequestId: string,
 		@ILogService private readonly logService: ILogService,
+		@ITelemetryService private readonly telemetryService: ITelemetryService,
 	) { }
+
+	/**
+	 * Extract IP code citations from copilot_annotations and convert to IIPCodeCitation format
+	 */
+	private extractIPCodeCitations(annotations?: { IPCodeCitations?: AnthropicIPCodeCitation[] }): IIPCodeCitation[] {
+		if (!annotations?.IPCodeCitations?.length) {
+			return [];
+		}
+
+		// Deduplicate by URL since the same citation can appear multiple times
+		const seenUrls = new Set<string>();
+		const citations: IIPCodeCitation[] = [];
+
+		for (const citation of annotations.IPCodeCitations) {
+			const citationDetails = citation.citations;
+			if (!citationDetails) {
+				continue;
+			}
+
+			const { url, license, snippet } = citationDetails;
+
+			if (typeof url !== 'string' || url.trim() === '') {
+				continue;
+			}
+
+			if (typeof license !== 'string' || license.trim() === '') {
+				continue;
+			}
+
+			if (typeof snippet !== 'string' || snippet.trim() === '') {
+				continue;
+			}
+
+			if (!seenUrls.has(url)) {
+				seenUrls.add(url);
+				citations.push({
+					citations: {
+						url,
+						license,
+						snippet,
+					}
+				});
+			}
+		}
+
+		if (citations.length > 0) {
+			this.logService.trace(`[messagesAPI] IP code citations found: ${citations.length} unique citations`);
+		}
+
+		return citations;
+	}
 
 	public push(chunk: AnthropicStreamEvent, _onProgress: FinishedCallback): ChatCompletion | undefined {
 		const onProgress = (delta: IResponseDelta): undefined => {
@@ -383,8 +470,8 @@ export class AnthropicMessagesProcessor {
 				if (chunk.message) {
 					this.messageId = chunk.message.id;
 					this.model = chunk.message.model;
-					this.inputTokens = chunk.message.usage.input_tokens;
-					this.outputTokens = chunk.message.usage.output_tokens;
+					this.inputTokens = chunk.message.usage.input_tokens ?? 0;
+					this.outputTokens = chunk.message.usage.output_tokens ?? 0;
 					this.cacheCreationTokens = chunk.message.usage.cache_creation_input_tokens ?? 0;
 					this.cacheReadTokens = chunk.message.usage.cache_read_input_tokens ?? 0;
 					if (chunk.message.usage.server_tool_use?.tool_search_requests) {
@@ -423,6 +510,24 @@ export class AnthropicMessagesProcessor {
 
 						this.logService.trace(`[messagesAPI] Tool search discovered ${toolNames.length} tools: ${toolNames.join(', ')}`);
 
+						/* __GDPR__
+							"toolSearchToolInvoked" : {
+								"owner": "bhavyaus",
+								"comment": "Details about invocation of tools",
+								"requestId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The request ID for correlation" },
+								"interactionId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The interaction ID for correlation" },
+								"validateOutcome": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The outcome of the tool input validation. valid, invalid and unknown" },
+								"invokeOutcome": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The outcome of the tool invocation. success, error" },
+								"toolName": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The name of the tool being invoked." },
+								"model": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model that invoked the tool" },
+								"discoveredToolCount": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Number of tools discovered", "isMeasurement": true }
+							}
+						*/
+						this.telemetryService.sendMSFTTelemetryEvent('toolSearchToolInvoked',
+							{ requestId: this.requestId, interactionId: this.requestId, validateOutcome: 'unknown', invokeOutcome: 'success', toolName: TOOL_SEARCH_TOOL_NAME, model: this.model },
+							{ discoveredToolCount: toolNames.length }
+						);
+
 						// Get the original server tool call to pair with this result
 						const serverToolCall = this.completedServerToolCalls.get(toolSearchResult.tool_use_id);
 						this.completedServerToolCalls.delete(toolSearchResult.tool_use_id);
@@ -450,6 +555,25 @@ export class AnthropicMessagesProcessor {
 						});
 					} else if (toolSearchResult.content.type === 'tool_search_tool_result_error') {
 						this.logService.warn(`[messagesAPI] Tool search error: ${toolSearchResult.content.error_code}`);
+
+						/* __GDPR__
+							"toolSearchToolInvoked" : {
+								"owner": "bhavyaus",
+								"comment": "Details about invocation of tools",
+								"requestId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The request ID for correlation" },
+								"interactionId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The interaction ID for correlation" },
+								"validateOutcome": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The outcome of the tool input validation. valid, invalid and unknown" },
+								"invokeOutcome": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The outcome of the tool invocation. success, error" },
+								"toolName": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The name of the tool being invoked." },
+								"model": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model that invoked the tool" },
+								"errorCode": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Error code if failed" },
+								"discoveredToolCount": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Number of tools discovered", "isMeasurement": true }
+							}
+						*/
+						this.telemetryService.sendMSFTTelemetryEvent('toolSearchToolInvoked',
+							{ requestId: this.requestId, interactionId: this.requestId, validateOutcome: 'unknown', invokeOutcome: 'error', toolName: TOOL_SEARCH_TOOL_NAME, model: this.model, errorCode: toolSearchResult.content.error_code },
+							{ discoveredToolCount: 0 }
+						);
 
 						// Get the original server tool call to pair with this error result
 						const serverToolCall = this.completedServerToolCalls.get(toolSearchResult.tool_use_id);
@@ -513,6 +637,10 @@ export class AnthropicMessagesProcessor {
 			case 'content_block_delta':
 				if (chunk.delta) {
 					if (chunk.delta.type === 'text_delta' && chunk.delta.text) {
+						const ipCitations = this.extractIPCodeCitations(chunk.copilot_annotations);
+						if (ipCitations.length > 0) {
+							return onProgress({ text: chunk.delta.text, ipCitations });
+						}
 						return onProgress({ text: chunk.delta.text });
 					} else if (chunk.delta.type === 'thinking_delta' && chunk.delta.thinking && chunk.index !== undefined) {
 						const thinking = this.thinkingAccumulator.get(chunk.index);
@@ -617,12 +745,40 @@ export class AnthropicMessagesProcessor {
 						(sum, edit) => sum + (edit.cleared_input_tokens || 0),
 						0
 					);
-					this.logService.trace(`[messagesAPI] Anthropic context editing applied: cleared ${totalClearedTokens} tokens.`);
-					this.telemetryData.extendedBy({
-						contextEditingApplied: 'true',
-						contextEditingClearedTokens: totalClearedTokens.toString(),
-						contextEditingEditCount: this.contextManagementResponse.applied_edits.length.toString(),
-					});
+					const totalClearedToolUses = this.contextManagementResponse.applied_edits.reduce(
+						(sum, edit) => sum + (edit.cleared_tool_uses || 0),
+						0
+					);
+					const totalClearedThinkingTurns = this.contextManagementResponse.applied_edits.reduce(
+						(sum, edit) => sum + (edit.cleared_thinking_turns || 0),
+						0
+					);
+					this.logService.trace(`[messagesAPI] Anthropic context editing applied: cleared ${totalClearedTokens} tokens, ${totalClearedToolUses} tool uses.`);
+
+					/* __GDPR__
+						"contextEditingApplied" : {
+							"owner": "bhavyaus",
+							"comment": "Tracks when Anthropic context editing is applied to manage context window",
+							"requestId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The request ID for correlation" },
+							"interactionId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The interaction ID for correlation" },
+							"model": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model used" },
+							"clearedTokens": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Total tokens cleared" },
+							"clearedToolUses": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Total tool uses cleared" },
+							"clearedThinkingTurns": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Total thinking turns cleared" }
+						}
+					*/
+					this.telemetryService.sendMSFTTelemetryEvent('contextEditingApplied',
+						{
+							requestId: this.requestId,
+							interactionId: this.requestId,
+							model: this.model,
+						},
+						{
+							clearedTokens: totalClearedTokens,
+							clearedToolUses: totalClearedToolUses,
+							clearedThinkingTurns: totalClearedThinkingTurns,
+						}
+					);
 				}
 				if (this.toolSearchRequests > 0) {
 					this.logService.trace(`[messagesAPI] Anthropic tool search requests: ${this.toolSearchRequests}.`);
@@ -631,7 +787,6 @@ export class AnthropicMessagesProcessor {
 						toolSearchRequests: this.toolSearchRequests.toString(),
 					});
 				}
-
 				let finishReason: FinishedCompletionReason;
 				switch (this.stopReason) {
 					case 'refusal':
@@ -644,6 +799,11 @@ export class AnthropicMessagesProcessor {
 					default:
 						finishReason = FinishedCompletionReason.Stop;
 						break;
+				}
+
+				const computedPromptTokens = this.inputTokens + this.cacheCreationTokens + this.cacheReadTokens;
+				if (computedPromptTokens < this.cacheReadTokens) {
+					this.logService.warn(`[messagesAPI] Token count inconsistency: computed prompt_tokens (${computedPromptTokens}) < cached_tokens (${this.cacheReadTokens}). Raw values: inputTokens=${this.inputTokens}, cacheCreationTokens=${this.cacheCreationTokens}, cacheReadTokens=${this.cacheReadTokens}`);
 				}
 
 				return {
@@ -661,9 +821,9 @@ export class AnthropicMessagesProcessor {
 						serverExperiments: ''
 					},
 					usage: {
-						prompt_tokens: this.inputTokens + this.cacheCreationTokens + this.cacheReadTokens,
+						prompt_tokens: computedPromptTokens,
 						completion_tokens: this.outputTokens,
-						total_tokens: this.inputTokens + this.cacheCreationTokens + this.cacheReadTokens + this.outputTokens,
+						total_tokens: computedPromptTokens + this.outputTokens,
 						prompt_tokens_details: {
 							cached_tokens: this.cacheReadTokens,
 						},

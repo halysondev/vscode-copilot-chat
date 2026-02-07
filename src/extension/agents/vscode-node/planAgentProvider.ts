@@ -20,6 +20,7 @@ interface PlanAgentHandoff {
 	prompt: string;
 	send?: boolean;
 	showContinueOn?: boolean;
+	model?: string;
 }
 
 /**
@@ -32,6 +33,8 @@ interface PlanAgentConfig {
 	tools: string[];
 	model?: string;
 	target?: string;
+	disableModelInvocation?: boolean;
+	agents?: string[];
 	handoffs: PlanAgentHandoff[];
 	body: string;
 }
@@ -45,6 +48,8 @@ const BASE_PLAN_AGENT_CONFIG: PlanAgentConfig = {
 	description: 'Researches and outlines multi-step plans',
 	argumentHint: 'Outline the goal or problem to research',
 	target: 'vscode',
+	disableModelInvocation: true,
+	agents: [],
 	tools: [
 		'agent',
 		'search',
@@ -56,21 +61,7 @@ const BASE_PLAN_AGENT_CONFIG: PlanAgentConfig = {
 		'github.vscode-pull-request-github/issue_fetch',
 		'github.vscode-pull-request-github/activePullRequest'
 	],
-	handoffs: [
-		{
-			label: 'Start Implementation',
-			agent: 'Implement',
-			prompt: 'Start implementation',
-			send: true
-		},
-		{
-			label: 'Open in Editor',
-			agent: 'agent',
-			prompt: '#createFile the plan as is into an untitled file (`untitled:plan-${camelCaseName}.prompt.md` without frontmatter) for further refinement.',
-			showContinueOn: false,
-			send: true
-		}
-	],
+	handoffs: [], // Handoffs are generated dynamically in buildCustomizedConfig
 	body: '' // Body is generated dynamically in buildCustomizedConfig
 };
 
@@ -93,12 +84,21 @@ export function buildAgentMarkdown(config: PlanAgentConfig): string {
 	if (config.target) {
 		lines.push(`target: ${config.target}`);
 	}
+	if (config.disableModelInvocation) {
+		lines.push(`disable-model-invocation: true`);
+	}
 
 	// Tools array - flow style for readability
 	// Escape single quotes by doubling them (YAML spec)
 	if (config.tools.length > 0) {
 		const quotedTools = config.tools.map(t => `'${t.replace(/'/g, '\'\'')}'`).join(', ');
 		lines.push(`tools: [${quotedTools}]`);
+	}
+
+	// Agents array - same format as tools (empty array = no subagents allowed)
+	if (config.agents) {
+		const quotedAgents = config.agents.map(a => `'${a.replace(/'/g, '\'\'')}'`).join(', ');
+		lines.push(`agents: [${quotedAgents}]`);
 	}
 
 	// Handoffs - block style for complex nested objects
@@ -114,6 +114,9 @@ export function buildAgentMarkdown(config: PlanAgentConfig): string {
 			}
 			if (handoff.showContinueOn !== undefined) {
 				lines.push(`    showContinueOn: ${handoff.showContinueOn}`);
+			}
+			if (handoff.model !== undefined) {
+				lines.push(`    model: ${handoff.model}`);
 			}
 		}
 	}
@@ -149,11 +152,14 @@ export class PlanAgentProvider extends Disposable implements vscode.ChatCustomAg
 		super();
 
 		// Listen for settings changes to refresh agents
+		// Note: When settings change, we fire onDidChangeCustomAgents which causes VS Code to re-fetch
+		// the agent definition. However, handoff buttons already rendered may not work as
+		// these capture the model at render time.
 		this._register(this.configurationService.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration(ConfigKey.PlanAgentAdditionalTools.fullyQualifiedId) ||
 				e.affectsConfiguration(ConfigKey.PlanAgentModel.fullyQualifiedId) ||
-				e.affectsConfiguration(ConfigKey.AskQuestionsEnabled.fullyQualifiedId)) {
-				this.logService.trace('[PlanAgentProvider] Settings changed, refreshing agent');
+				e.affectsConfiguration(ConfigKey.AskQuestionsEnabled.fullyQualifiedId) ||
+				e.affectsConfiguration(ConfigKey.ImplementAgentModel.fullyQualifiedId)) {
 				this._onDidChangeCustomAgents.fire();
 			}
 		}));
@@ -193,26 +199,15 @@ export class PlanAgentProvider extends Disposable implements vscode.ChatCustomAg
 		return fileUri;
 	}
 
-	private buildCustomizedConfig(): PlanAgentConfig {
-		const additionalTools = this.configurationService.getConfig(ConfigKey.PlanAgentAdditionalTools);
-		const modelOverride = this.configurationService.getConfig(ConfigKey.PlanAgentModel);
-
-		// Check askQuestions config first (needed for both tools and body)
-		const askQuestionsEnabled = this.configurationService.getConfig(ConfigKey.AskQuestionsEnabled);
-
-		// Start with base config, using dynamic body based on askQuestions setting
-		const config: PlanAgentConfig = {
-			...BASE_PLAN_AGENT_CONFIG,
-			tools: [...BASE_PLAN_AGENT_CONFIG.tools],
-			handoffs: [...BASE_PLAN_AGENT_CONFIG.handoffs],
-			body: `You are a PLANNING AGENT, pairing with the user to create a detailed, actionable plan.
+	static buildAgentBody(askQuestionsEnabled: boolean): string {
+		return `You are a PLANNING AGENT, pairing with the user to create a detailed, actionable plan.
 
 Your job: research the codebase → clarify with the user → produce a comprehensive plan. This iterative approach catches edge cases and non-obvious requirements BEFORE implementation begins.
 
 Your SOLE responsibility is planning. NEVER start implementation.
 
 <rules>
-- STOP if you consider running file editing tools — plans are for others to execute${askQuestionsEnabled ? `\n- Use #tool:vscode/askQuestions freely to clarify requirements — don't make large assumptions` : ''}
+- STOP if you consider running file editing tools — plans are for others to execute${askQuestionsEnabled ? `\n- Use #tool:vscode/askQuestions freely to clarify requirements — don't make large assumptions` : `\n- Include a "Further Considerations" section in your plan for clarifying questions`}
 - Present a well-researched plan with loose ends tied BEFORE implementation
 </rules>
 
@@ -228,6 +223,7 @@ MANDATORY: Instruct the subagent to work autonomously following <research_instru
 <research_instructions>
 - Research the user's task comprehensively using read-only tools.
 - Start with high-level code searches before reading specific files.
+- Pay special attention to instructions and skills made available by the developers to understand best practices and intended usage.
 - Identify missing information, conflicting requirements, or technical unknowns.
 - DO NOT draft a full plan yet — focus on discovery and feasibility.
 </research_instructions>
@@ -236,7 +232,7 @@ After the subagent returns, analyze the results.
 
 ## 2. Alignment
 
-If research reveals major ambiguities or if you need to validate assumptions:${askQuestionsEnabled ? `\n- Use #tool:vscode/askQuestions to clarify intent with the user.` : ''}
+If research reveals major ambiguities or if you need to validate assumptions:${askQuestionsEnabled ? `\n- Use #tool:vscode/askQuestions to clarify intent with the user.` : `\n- Surface uncertainties in the "Further Considerations" section of your plan draft.`}
 - Surface discovered technical constraints or alternative approaches.
 - If answers significantly change the scope, loop back to **Discovery**.
 
@@ -255,7 +251,7 @@ Present the plan as a **DRAFT** for review.
 
 On user input after showing a draft:
 - Changes requested → revise and present updated plan.
-- Questions asked → clarify${askQuestionsEnabled ? ', or use #tool:vscode/askQuestions for follow-ups' : ''}.
+- Questions asked → clarify${askQuestionsEnabled ? ', or use #tool:vscode/askQuestions for follow-ups' : ' and update "Further Considerations" as needed'}.
 - Alternatives wanted → loop back to **Discovery** with new subagent.
 - Approval given → acknowledge, the user can now use handoff buttons.
 
@@ -284,13 +280,52 @@ Keep iterating until explicit approval or handoff.
 
 **Decisions** (if applicable)
 - {Decision: chose X over Y}
-\`\`\`
+${askQuestionsEnabled ? '' : `
+**Further Considerations** (if applicable, 1-3 items)
+1. {Clarifying question with recommendation? Option A / Option B / Option C}
+2. {…}
+`}\`\`\`
 
 Rules:
 - NO code blocks — describe changes, link to files/symbols
-- NO questions at the end${askQuestionsEnabled ? ' — ask during workflow via #tool:vscode/askQuestions' : ''}
+${askQuestionsEnabled ? '- NO questions at the end — ask during workflow via #tool:vscode/askQuestions' : '- Include "Further Considerations" section for clarifying questions'}
 - Keep scannable
-</plan_style_guide>`,
+</plan_style_guide>`;
+	}
+
+	private buildCustomizedConfig(): PlanAgentConfig {
+		const additionalTools = this.configurationService.getConfig(ConfigKey.PlanAgentAdditionalTools);
+		const modelOverride = this.configurationService.getConfig(ConfigKey.PlanAgentModel);
+
+		// Check askQuestions config first (needed for both tools and body)
+		const askQuestionsEnabled = this.configurationService.getConfig(ConfigKey.AskQuestionsEnabled);
+
+
+		const implementAgentModelOverride = this.configurationService.getConfig(ConfigKey.ImplementAgentModel);
+
+		// Build handoffs dynamically with model override
+		const startImplementationHandoff: PlanAgentHandoff = {
+			label: 'Start Implementation',
+			agent: 'agent',
+			prompt: 'Start implementation',
+			send: true,
+			...(implementAgentModelOverride ? { model: implementAgentModelOverride } : {})
+		};
+
+		const openInEditorHandoff: PlanAgentHandoff = {
+			label: 'Open in Editor',
+			agent: 'agent',
+			prompt: '#createFile the plan as is into an untitled file (`untitled:plan-${camelCaseName}.prompt.md` without frontmatter) for further refinement.',
+			showContinueOn: false,
+			send: true
+		};
+
+		// Start with base config, using dynamic body based on askQuestions setting
+		const config: PlanAgentConfig = {
+			...BASE_PLAN_AGENT_CONFIG,
+			tools: [...BASE_PLAN_AGENT_CONFIG.tools],
+			handoffs: [startImplementationHandoff, openInEditorHandoff, ...BASE_PLAN_AGENT_CONFIG.handoffs],
+			body: PlanAgentProvider.buildAgentBody(askQuestionsEnabled)
 		};
 
 		// Collect tools to add
@@ -299,19 +334,16 @@ Rules:
 		// Add askQuestions tool if enabled
 		if (askQuestionsEnabled) {
 			toolsToAdd.push('vscode/askQuestions');
-			this.logService.trace(`[PlanAgentProvider] Adding askQuestions tool (enabled)`);
 		}
 
 		// Merge additional tools (deduplicated)
 		if (toolsToAdd.length > 0) {
 			config.tools = [...new Set([...config.tools, ...toolsToAdd])];
-			this.logService.trace(`[PlanAgentProvider] Merged additional tools: ${toolsToAdd.join(', ')}`);
 		}
 
 		// Apply model override
 		if (modelOverride) {
 			config.model = modelOverride;
-			this.logService.trace(`[PlanAgentProvider] Applied model override: ${modelOverride}`);
 		}
 
 		return config;

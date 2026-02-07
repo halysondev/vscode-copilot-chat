@@ -53,6 +53,7 @@ import { DebugRecorder } from '../../extension/inlineEdits/node/debugRecorder';
 import { INextEditProvider, NESInlineCompletionContext, NextEditProvider } from '../../extension/inlineEdits/node/nextEditProvider';
 import { LlmNESTelemetryBuilder, NextEditProviderTelemetryBuilder, TelemetrySender } from '../../extension/inlineEdits/node/nextEditProviderTelemetry';
 import { INextEditResult } from '../../extension/inlineEdits/node/nextEditResult';
+import { IPowerService, NullPowerService } from '../../extension/power/common/powerService';
 import { ChatMLFetcherImpl } from '../../extension/prompt/node/chatMLFetcher';
 import { XtabProvider } from '../../extension/xtab/node/xtabProvider';
 import { IAuthenticationService } from '../../platform/authentication/common/authentication';
@@ -110,7 +111,7 @@ import { ITokenizerProvider, TokenizerProvider } from '../../platform/tokenizer/
 import { IWorkspaceService, NullWorkspaceService } from '../../platform/workspace/common/workspaceService';
 import { InstantiationServiceBuilder } from '../../util/common/services';
 import { CancellationToken } from '../../util/vs/base/common/cancellation';
-import { Emitter } from '../../util/vs/base/common/event';
+import { Emitter, Event as VsEvent } from '../../util/vs/base/common/event';
 import { Disposable, IDisposable } from '../../util/vs/base/common/lifecycle';
 import { IObservableWithChange } from '../../util/vs/base/common/observableInternal';
 import { URI } from '../../util/vs/base/common/uri';
@@ -363,6 +364,7 @@ function setupServices(options: INESProviderOptions) {
 	builder.define(ITelemetryService, new SyncDescriptor(SimpleTelemetryService, [telemetrySender]));
 	builder.define(IAuthenticationService, new SyncDescriptor(StaticGitHubAuthenticationService, [createStaticGitHubTokenProvider()]));
 	builder.define(ICopilotTokenManager, copilotTokenManager);
+	builder.define(IPowerService, new SyncDescriptor(NullPowerService));
 	builder.define(IChatMLFetcher, new SyncDescriptor(ChatMLFetcherImpl));
 	builder.define(IChatQuotaService, new SyncDescriptor(ChatQuotaService));
 	builder.define(IInteractionService, new SyncDescriptor(InteractionService));
@@ -648,7 +650,7 @@ class InlineCompletionsProvider extends Disposable implements IInlineCompletions
 		@IInstantiationService private _insta: IInstantiationService,
 		@IExperimentationService private readonly _expService: IExperimentationService,
 		@ICompletionsSpeculativeRequestCache private readonly _speculativeRequestCache: ICompletionsSpeculativeRequestCache,
-
+		@ILogService private readonly _logService: ILogService,
 	) {
 		super();
 		this._register(_insta);
@@ -662,7 +664,8 @@ class InlineCompletionsProvider extends Disposable implements IInlineCompletions
 	}
 
 	async getInlineCompletions(textDocument: ITextDocument, position: Position, token?: CancellationToken, options?: IGetInlineCompletionsOptions): Promise<CopilotCompletion[] | undefined> {
-		return await this.ghostText.getInlineCompletions(textDocument, position, token ?? CancellationToken.None, options, new GhostTextLogContext(textDocument.uri, textDocument.version, undefined));
+		const telemetryBuilder = new LlmNESTelemetryBuilder(undefined, undefined, undefined, 'ghostText', undefined);
+		return await this.ghostText.getInlineCompletions(textDocument, position, token ?? CancellationToken.None, options, new GhostTextLogContext(textDocument.uri, textDocument.version, undefined), telemetryBuilder, this._logService);
 	}
 
 	async inlineCompletionShown(completionId: string): Promise<void> {
@@ -830,6 +833,7 @@ function setupCompletionServices(options: IInlineCompletionsProviderOptions): II
 		readonly devDeviceId = editorSession.machineId;
 		readonly vscodeVersion = options.editorInfo.version;
 		readonly isActive = true;
+		readonly onDidChangeWindowState: vscode.Event<vscode.WindowState> = VsEvent.None;
 		readonly remoteName = editorSession.remoteName;
 		readonly uiKind = editorSession.uiKind === 'web' ? 'web' : 'desktop';
 		readonly OS = process.platform === 'darwin' ? OperatingSystem.Macintosh : process.platform === 'win32' ? OperatingSystem.Windows : OperatingSystem.Linux;
