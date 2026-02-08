@@ -5672,9 +5672,9 @@
 		"analyze-edits": "tsx script/analyzeEdits.ts",
 		"extract-chat-lib": "tsx script/build/extractChatLib.ts",
 		"create_venv": "tsx script/setup/createVenv.mts",
-		"package": "taskkill /F /IM esbuild.exe 2>nul & vsce package",
-		"install-code": "code --install-extension copilot-chat-%npm_package_version%.vsix --force",
-		"install-insider": "code-insiders --install-extension copilot-chat-%npm_package_version%.vsix --force",
+		"package": "taskkill /F /IM esbuild.exe 2>nul & tsx script/build/packageVsix.ts",
+		"install-code": "for %f in (copilot-chat-0.38.*.vsix) do code --install-extension %f --force",
+		"install-insider": "for %f in (copilot-chat-0.38.*.vsix) do code-insiders --install-extension %f --force",
 		"web": "vscode-test-web --headless --extensionDevelopmentPath=. .",
 		"test:prompt": "mocha \"src/extension/completions-core/vscode-node/prompt/**/test/**/*.test.{ts,tsx}\"",
 		"test:completions-core": "tsx src/extension/completions-core/vscode-node/extension/test/runTest.ts"
