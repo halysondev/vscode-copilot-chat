@@ -28,6 +28,8 @@ import { IClaudeSlashCommandService } from '../../../agents/claude/vscode-node/c
 import { createExtensionUnitTestingServices } from '../../../test/node/services';
 import { FolderRepositoryMRUEntry, IFolderRepositoryManager } from '../../common/folderRepositoryManager';
 import { ClaudeChatSessionContentProvider, UNAVAILABLE_MODEL_ID } from '../claudeChatSessionContentProvider';
+import type { ClaudeAgentManager } from '../../../agents/claude/node/claudeCodeAgent';
+import type { ClaudeChatSessionItemProvider } from '../claudeChatSessionItemProvider';
 
 // Mock types for testing
 interface MockClaudeSession {
@@ -36,6 +38,7 @@ interface MockClaudeSession {
 		type: 'user' | 'assistant';
 		message: Record<string, unknown>;
 	}>;
+	subagents: Array<unknown>;
 }
 
 class MockFolderRepositoryManager implements IFolderRepositoryManager {
@@ -126,7 +129,7 @@ function createProviderWithServices(
 
 	const accessor = serviceCollection.createTestingAccessor();
 	const instaService = accessor.get(IInstantiationService);
-	const provider = instaService.createInstance(ClaudeChatSessionContentProvider);
+	const provider = instaService.createInstance(ClaudeChatSessionContentProvider, {} as ClaudeAgentManager, {} as ClaudeChatSessionItemProvider);
 	return { provider, accessor };
 }
 
@@ -227,7 +230,7 @@ describe('ChatSessionContentProvider', () => {
 			[IClaudeCodeSessionService, realSessionService],
 			[IClaudeCodeModels, mockClaudeCodeModels]
 		));
-		const provider = childInstantiationService.createInstance(ClaudeChatSessionContentProvider);
+		const provider = childInstantiationService.createInstance(ClaudeChatSessionContentProvider, {} as ClaudeAgentManager, {} as ClaudeChatSessionItemProvider);
 
 		const sessionUri = createClaudeSessionUri('4c289ca8-f8bb-4588-8400-88b78beb784d');
 		const result = await provider.provideChatSessionContent(sessionUri, CancellationToken.None);
@@ -250,6 +253,7 @@ describe('ChatSessionContentProvider', () => {
 						model: 'claude-opus-4-5-20251101',
 					},
 				}],
+				subagents: [],
 			};
 
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
@@ -274,6 +278,7 @@ describe('ChatSessionContentProvider', () => {
 						model: 'claude-opus-4-5-20251101',
 					},
 				}],
+				subagents: [],
 			};
 
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
@@ -296,6 +301,7 @@ describe('ChatSessionContentProvider', () => {
 						content: 'Hello',
 					},
 				}],
+				subagents: [],
 			};
 
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
@@ -319,6 +325,7 @@ describe('ChatSessionContentProvider', () => {
 						model: 'claude-unknown-1-0-20251101',
 					},
 				}],
+				subagents: [],
 			};
 
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
@@ -343,6 +350,7 @@ describe('ChatSessionContentProvider', () => {
 						model: 'claude-opus-4-5-20251101',
 					},
 				}],
+				subagents: [],
 			};
 
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
@@ -385,6 +393,7 @@ describe('ChatSessionContentProvider', () => {
 						},
 					},
 				],
+				subagents: [],
 			};
 
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
@@ -535,6 +544,7 @@ describe('ChatSessionContentProvider', () => {
 					type: 'user',
 					message: { role: 'user', content: 'Hello' },
 				}],
+				subagents: [],
 			};
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
 
@@ -567,6 +577,7 @@ describe('ChatSessionContentProvider', () => {
 					type: 'user',
 					message: { role: 'user', content: 'Hello' },
 				}],
+				subagents: [],
 			};
 			vi.mocked(mockSessionService.getSession).mockResolvedValue(session as any);
 
@@ -651,6 +662,120 @@ describe('ChatSessionContentProvider', () => {
 
 			const folderInfo = emptyWorkspaceProvider.getFolderInfoForSession('test-session');
 			expect(folderInfo.cwd).toBe(selectedFolder.fsPath);
+		});
+	});
+
+	// #endregion
+
+	// #region Option Change Local Storage
+
+	describe('provideHandleOptionsChange stores locally without updating session state', () => {
+		it('stores model selection locally and does not update session state service', async () => {
+			const sessionUri = createClaudeSessionUri('test-session');
+			const mockSessionStateService = accessor.get(IClaudeSessionStateService);
+			const setModelSpy = vi.spyOn(mockSessionStateService, 'setModelIdForSession');
+
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'model', value: 'claude-3-5-haiku-20241022' }],
+				CancellationToken.None
+			);
+
+			// Session state service should NOT have been called
+			expect(setModelSpy).not.toHaveBeenCalled();
+
+			// But getModelIdForSession should return the local selection
+			const modelId = await provider.getModelIdForSession('test-session');
+			expect(modelId).toBe('claude-3-5-haiku-20241022');
+		});
+
+		it('stores permission mode selection locally and does not update session state service', async () => {
+			const sessionUri = createClaudeSessionUri('test-session');
+			const mockSessionStateService = accessor.get(IClaudeSessionStateService);
+			const setPermissionSpy = vi.spyOn(mockSessionStateService, 'setPermissionModeForSession');
+
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'permissionMode', value: 'plan' }],
+				CancellationToken.None
+			);
+
+			// Session state service should NOT have been called
+			expect(setPermissionSpy).not.toHaveBeenCalled();
+
+			// But getPermissionModeForSession should return the local selection
+			const permissionMode = provider.getPermissionModeForSession('test-session');
+			expect(permissionMode).toBe('plan');
+		});
+
+		it('local model selection is used in provideChatSessionContent', async () => {
+			vi.mocked(mockSessionService.getSession).mockResolvedValue(undefined);
+
+			const sessionUri = createClaudeSessionUri('test-session');
+
+			// Set a local model selection
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'model', value: 'claude-3-5-haiku-20241022' }],
+				CancellationToken.None
+			);
+
+			const result = await provider.provideChatSessionContent(sessionUri, CancellationToken.None);
+			expect(result.options?.['model']).toBe('claude-3-5-haiku-20241022');
+		});
+
+		it('local permission mode selection is used in provideChatSessionContent', async () => {
+			vi.mocked(mockSessionService.getSession).mockResolvedValue(undefined);
+
+			const sessionUri = createClaudeSessionUri('test-session');
+
+			// Set a local permission mode selection
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'permissionMode', value: 'plan' }],
+				CancellationToken.None
+			);
+
+			const result = await provider.provideChatSessionContent(sessionUri, CancellationToken.None);
+			expect(result.options?.['permissionMode']).toBe('plan');
+		});
+
+		it('local model selection takes priority over session state service', async () => {
+			const sessionUri = createClaudeSessionUri('test-session');
+
+			// Set a value in the session state service directly (as if committed during a previous request)
+			const mockSessionStateService = accessor.get(IClaudeSessionStateService);
+			mockSessionStateService.setModelIdForSession('test-session', 'claude-3-5-sonnet-20241022');
+
+			// Now set a different local selection
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'model', value: 'claude-3-5-haiku-20241022' }],
+				CancellationToken.None
+			);
+
+			// Local selection should take priority
+			const modelId = await provider.getModelIdForSession('test-session');
+			expect(modelId).toBe('claude-3-5-haiku-20241022');
+		});
+
+		it('local permission mode selection takes priority over session state service', async () => {
+			const sessionUri = createClaudeSessionUri('test-session');
+
+			// Set a value in the session state service directly
+			const mockSessionStateService = accessor.get(IClaudeSessionStateService);
+			mockSessionStateService.setPermissionModeForSession('test-session', 'acceptEdits');
+
+			// Now set a different local selection
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'permissionMode', value: 'plan' }],
+				CancellationToken.None
+			);
+
+			// Local selection should take priority
+			const permissionMode = provider.getPermissionModeForSession('test-session');
+			expect(permissionMode).toBe('plan');
 		});
 	});
 

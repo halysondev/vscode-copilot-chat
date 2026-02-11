@@ -134,6 +134,11 @@ describe('ClaudeCodeSessionService', () => {
 				'553dd2b5-8a53-4fbf-9db2-240632522fe5',
 				'b02ed4d8-1f00-45cc-949f-3ea63b2dbde2'
 			]);
+
+			// All sessions should have the workspace folder name
+			for (const session of sessions) {
+				expect(session.folderName).toBe('project');
+			}
 		});
 
 		it('skips files that fail to read', async () => {
@@ -572,6 +577,12 @@ describe('ClaudeCodeSessionService', () => {
 			const ids = sessions.map(s => s.id);
 			expect(ids).toContain('session-mru1');
 			expect(ids).toContain('session-mru2');
+
+			// Each session should have its respective MRU folder name
+			const session1 = sessions.find(s => s.id === 'session-mru1')!;
+			const session2 = sessions.find(s => s.id === 'session-mru2')!;
+			expect(session1.folderName).toBe('project');
+			expect(session2.folderName).toBe('project');
 		});
 	});
 
@@ -668,6 +679,12 @@ describe('ClaudeCodeSessionService', () => {
 			const ids = sessions.map(s => s.id);
 			expect(ids).toContain('session-from-folder1');
 			expect(ids).toContain('session-from-folder2');
+
+			// Each session should have its respective folder name
+			const session1 = sessions.find(s => s.id === 'session-from-folder1')!;
+			const session2 = sessions.find(s => s.id === 'session-from-folder2')!;
+			expect(session1.folderName).toBe('project1');
+			expect(session2.folderName).toBe('project2');
 		});
 	});
 
@@ -803,6 +820,37 @@ describe('ClaudeCodeSessionService', () => {
 
 			expect(session).toBeDefined();
 			expect(session?.subagents).toHaveLength(0);
+		});
+
+		it('loads subagents from real fixture files', async () => {
+			const sessionId = '50a7220d-7250-46f3-b38e-b716ce25032e';
+			const fileName = `${sessionId}.jsonl`;
+			const fixturePath = path.resolve(__dirname, '../../test/fixtures', fileName);
+			const fileContents = await readFile(fixturePath, 'utf8');
+
+			const subagentFixturePath = path.resolve(__dirname, '../../test/fixtures', sessionId, 'subagents', 'agent-a21e2f5.jsonl');
+			const subagentContents = await readFile(subagentFixturePath, 'utf8');
+
+			const subagentsDirUri = URI.joinPath(dirUri, sessionId, 'subagents');
+
+			// Mock the directory structure with real fixture data
+			mockFs.mockDirectory(dirUri, [
+				[fileName, FileType.File],
+				[sessionId, FileType.Directory]
+			]);
+			mockFs.mockFile(URI.joinPath(dirUri, fileName), fileContents, 1000);
+			mockFs.mockDirectory(subagentsDirUri, [['agent-a21e2f5.jsonl', FileType.File]]);
+			mockFs.mockFile(URI.joinPath(subagentsDirUri, 'agent-a21e2f5.jsonl'), subagentContents, 1000);
+
+			const sessionResource = URI.from({ scheme: 'claude-code', path: '/' + sessionId });
+			const session = await service.getSession(sessionResource, CancellationToken.None);
+
+			expect(session).toBeDefined();
+			expect(session?.id).toBe(sessionId);
+			expect(session?.messages.length).toBeGreaterThan(0);
+			expect(session?.subagents).toHaveLength(1);
+			expect(session?.subagents[0].agentId).toBe('a21e2f5');
+			expect(session?.subagents[0].messages.length).toBeGreaterThan(0);
 		});
 
 		it('filters non-agent files in subagents directory', async () => {

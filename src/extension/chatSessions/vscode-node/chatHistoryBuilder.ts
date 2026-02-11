@@ -5,9 +5,10 @@
 
 import * as vscode from 'vscode';
 import { coalesce } from '../../../util/vs/base/common/arrays';
-import { ChatRequestTurn2 } from '../../../vscodeTypes';
+import { URI } from '../../../util/vs/base/common/uri';
+import { ChatReferenceBinaryData, ChatRequestTurn2 } from '../../../vscodeTypes';
 import { completeToolInvocation, createFormattedToolInvocation } from '../../agents/claude/common/toolInvocationFormatter';
-import { AssistantMessageContent, ContentBlock, IClaudeCodeSession, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock } from '../../agents/claude/node/sessionParser/claudeSessionSchema';
+import { AssistantMessageContent, ContentBlock, IClaudeCodeSession, ImageBlock, ISubagentSession, StoredMessage, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock } from '../../agents/claude/node/sessionParser/claudeSessionSchema';
 
 // #region Types
 
@@ -34,6 +35,10 @@ function isToolUseBlock(block: ContentBlock): block is ToolUseBlock {
 
 function isToolResultBlock(block: ContentBlock): block is ToolResultBlock {
 	return block.type === 'tool_result';
+}
+
+function isImageBlock(block: ContentBlock): block is ImageBlock {
+	return block.type === 'image';
 }
 
 // #endregion
@@ -111,6 +116,55 @@ function processToolResults(content: string | ContentBlock[], toolContext: ToolC
 
 // #endregion
 
+// #region Image Reference Extraction
+
+/**
+ * Extracts image blocks from user message contents and converts them to
+ * ChatPromptReference objects.
+ *
+ * - Base64 images become ChatReferenceBinaryData values (binary data for display).
+ * - URL images become URI values (the API stored a URL rather than inline data).
+ */
+function extractImageReferences(contents: readonly (string | ContentBlock[])[]): vscode.ChatPromptReference[] {
+	const references: vscode.ChatPromptReference[] = [];
+	let imageIndex = 0;
+	for (const content of contents) {
+		if (typeof content === 'string') {
+			continue;
+		}
+		for (const block of content) {
+			if (!isImageBlock(block)) {
+				continue;
+			}
+			const id = `image-${imageIndex + 1}`;
+			if (block.source.type === 'base64') {
+				const source = block.source;
+				// NOTE: The API does not give us any metadata about the image beyond the media type, so
+				// we use a generic name and the media type as the MIME type for the binary reference.
+				references.push({
+					id,
+					name: id,
+					value: new ChatReferenceBinaryData(
+						source.media_type,
+						() => Promise.resolve(Buffer.from(source.data, 'base64'))
+					),
+				});
+				imageIndex++;
+			} else if (block.source.type === 'url') {
+				references.push({
+					id,
+					name: id,
+					value: URI.parse(block.source.url),
+				});
+				imageIndex++;
+			}
+		}
+	}
+	return references;
+}
+
+// #endregion
+
 // #region Turn Extraction
 
 /**
@@ -127,9 +181,10 @@ function extractUserRequest(contents: readonly (string | ContentBlock[])[]): vsc
 	}
 
 	const combinedText = textParts.join('\n\n');
+	const imageReferences = extractImageReferences(contents);
 
-	// If no visible text, don't create a request turn
-	if (!combinedText.trim()) {
+	// If no visible text and no images, don't create a request turn
+	if (!combinedText.trim() && imageReferences.length === 0) {
 		return;
 	}
 
@@ -138,7 +193,7 @@ function extractUserRequest(contents: readonly (string | ContentBlock[])[]): vsc
 		return;
 	}
 
-	return new ChatRequestTurn2(combinedText, undefined, [], '', [], undefined, undefined);
+	return new ChatRequestTurn2(combinedText, undefined, imageReferences, '', [], undefined, undefined);
 }
 
 /**
@@ -170,6 +225,78 @@ function extractAssistantParts(messages: readonly AssistantMessageContent[], too
 
 // #endregion
 
+// #region Subagent Tool Extraction
+
+/**
+ * Builds a map from agentId to ISubagentSession for quick lookup.
+ */
+function buildSubagentMap(subagents: readonly ISubagentSession[]): Map<string, ISubagentSession> {
+	const map = new Map<string, ISubagentSession>();
+	for (const subagent of subagents) {
+		map.set(subagent.agentId, subagent);
+	}
+	return map;
+}
+
+/**
+ * Extracts the tool_use_id from the first tool_result block in a user message's content.
+ * Used to identify the Task tool_use that spawned a subagent — when `toolUseResultAgentId`
+ * is set on a StoredMessage, the corresponding tool_result block carries the Task's tool_use_id.
+ */
+function extractToolResultToolUseId(content: string | ContentBlock[]): string | undefined {
+	if (typeof content === 'string') {
+		return undefined;
+	}
+	for (const block of content) {
+		if (isToolResultBlock(block)) {
+			return block.tool_use_id;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Extracts tool invocation parts from a subagent session's messages.
+ * These are the tool calls made by the subagent during its execution.
+ * Each tool invocation has subAgentInvocationId set to associate it with the parent Task.
+ */
+function extractSubagentToolParts(
+	subagent: ISubagentSession,
+	taskToolUseId: string
+): vscode.ChatToolInvocationPart[] {
+	const toolContext: ToolContext = {
+		unprocessedToolCalls: new Map(),
+		pendingToolInvocations: new Map()
+	};
+	const parts: vscode.ChatToolInvocationPart[] = [];
+
+	for (const message of subagent.messages) {
+		if (message.type === 'assistant') {
+			const assistantContent = message.message as AssistantMessageContent;
+			for (const block of assistantContent.content) {
+				if (isToolUseBlock(block)) {
+					toolContext.unprocessedToolCalls.set(block.id, block);
+					const toolInvocation = createFormattedToolInvocation(block, true);
+					if (toolInvocation) {
+						toolInvocation.subAgentInvocationId = taskToolUseId;
+						toolContext.pendingToolInvocations.set(block.id, toolInvocation);
+						parts.push(toolInvocation);
+					}
+				}
+			}
+		} else if (message.type === 'user') {
+			const content = message.message.content;
+			if (typeof content !== 'string') {
+				processToolResults(content, toolContext);
+			}
+		}
+	}
+
+	return parts;
+}
+
+// #endregion
+
 // #region Main Entry Point
 
 /**
@@ -192,20 +319,42 @@ export function buildChatHistory(session: IClaudeCodeSession): (vscode.ChatReque
 	const messages = session.messages;
 	let pendingResponseParts: (vscode.ChatResponseMarkdownPart | vscode.ChatResponseThinkingProgressPart | vscode.ChatToolInvocationPart)[] = [];
 
+	// Build a map from agentId to subagent for quick lookup
+	const subagentMap = buildSubagentMap(session.subagents);
+
 	while (i < messages.length) {
 		const currentType = messages[i].type;
 
 		if (currentType === 'user') {
-			// Collect all consecutive user messages
-			const userContents: (string | ContentBlock[])[] = [];
+			// Collect all consecutive user messages (preserving the full StoredMessage for metadata)
+			const userMessages: StoredMessage[] = [];
 			while (i < messages.length && messages[i].type === 'user' && messages[i].message.role === 'user') {
-				userContents.push(messages[i].message.content as string | ContentBlock[]);
+				userMessages.push(messages[i]);
 				i++;
 			}
+
+			const userContents = userMessages.map(m => m.message.content as string | ContentBlock[]);
 
 			// Always process tool results to update pending tool invocations
 			for (const content of userContents) {
 				processToolResults(content, toolContext);
+			}
+
+			// After processing tool results, inject subagent tool calls for completed Task tools.
+			// Each StoredMessage with toolUseResultAgentId represents a Task tool result linked to a
+			// subagent. The tool_use_id is extracted directly from the message's tool_result block,
+			// ensuring a 1:1 correlation even when multiple Task results appear consecutively.
+			for (const msg of userMessages) {
+				if (msg.toolUseResultAgentId) {
+					const subagent = subagentMap.get(msg.toolUseResultAgentId);
+					if (subagent) {
+						const taskToolUseId = extractToolResultToolUseId(msg.message.content);
+						if (taskToolUseId) {
+							const subagentParts = extractSubagentToolParts(subagent, taskToolUseId);
+							pendingResponseParts.push(...subagentParts);
+						}
+					}
+				}
 			}
 
 			// Check if there's actual user text (not just tool results)
