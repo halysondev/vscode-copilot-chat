@@ -17,6 +17,7 @@ import { URI } from '../../../util/vs/base/common/uri';
 import { generateUuid } from '../../../util/vs/base/common/uuid';
 import { ClaudeFolderInfo } from '../../agents/claude/common/claudeFolderInfo';
 import { ClaudeAgentManager } from '../../agents/claude/node/claudeCodeAgent';
+import { ClaudeCodeReasoningLevel, isOpus46Model } from '../../agents/claude/node/claude-code';
 import { IClaudeCodeModels, NoClaudeModelsAvailableError } from '../../agents/claude/node/claudeCodeModels';
 import { IClaudeSessionStateService } from '../../agents/claude/node/claudeSessionStateService';
 import { IClaudeCodeSessionService } from '../../agents/claude/node/sessionParser/claudeCodeSessionService';
@@ -37,6 +38,7 @@ import '../../agents/claude/vscode-node/mcpServers/index';
 
 const MODELS_OPTION_ID = 'model';
 const PERMISSION_MODE_OPTION_ID = 'permissionMode';
+const REASONING_EFFORT_OPTION_ID = 'reasoningEffort';
 const FOLDER_OPTION_ID = 'folder';
 const MAX_MRU_ENTRIES = 10;
 
@@ -341,6 +343,17 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 			permissionModeItems.push({ id: 'bypassPermissions', name: l10n.t('Bypass all permissions') });
 		}
 
+		// Get the current default model to determine available reasoning options
+		const defaultModelId = models.length > 0 ? (await this.claudeCodeModels.getDefaultModel()) : undefined;
+		const reasoningEffortOptions = this.claudeCodeModels.getReasoningEffortOptions(defaultModelId);
+		const currentReasoningEffort = this.claudeCodeModels.getReasoningEffort();
+		const reasoningEffortItems: vscode.ChatSessionProviderOptionItem[] = reasoningEffortOptions.map(opt => ({
+			id: opt.id,
+			name: opt.name,
+			description: opt.description,
+			default: opt.id === currentReasoningEffort,
+		}));
+
 		const optionGroups: vscode.ChatSessionProviderOptions['optionGroups'] = [
 			{
 				id: PERMISSION_MODE_OPTION_ID,
@@ -353,6 +366,12 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 				name: l10n.t('Model'),
 				description: l10n.t('Pick Model'),
 				items: modelItems,
+			},
+			{
+				id: REASONING_EFFORT_OPTION_ID,
+				name: l10n.t('Thinking'),
+				description: l10n.t('Pick Reasoning Effort'),
+				items: reasoningEffortItems,
 			}
 		];
 
@@ -386,12 +405,25 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 				// Store locally; committed to session state service when handling the next request
 				this._sessionModels.set(sessionId, update.value);
 				await this.claudeCodeModels.setDefaultModel(update.value);
+
+				// If current reasoning effort is 'max' and new model doesn't support it, fall back to 'high'
+				const currentEffort = this.claudeCodeModels.getReasoningEffort();
+				if (currentEffort === 'max' && !isOpus46Model(update.value)) {
+					await this.claudeCodeModels.setReasoningEffort('high');
+				}
+
+				// Refresh provider options so reasoning effort dropdown updates
+				// (e.g., 'max' only shows for Opus 4.6)
+				this._onDidChangeChatSessionProviderOptions.fire();
 			} else if (update.optionId === PERMISSION_MODE_OPTION_ID) {
 				if (!update.value) {
 					continue;
 				}
 				// Store locally; committed to session state service when handling the next request
 				this._sessionPermissionModes.set(sessionId, update.value as PermissionMode);
+			} else if (update.optionId === REASONING_EFFORT_OPTION_ID && update.value) {
+				// Reasoning effort is a global setting, not per-session
+				await this.claudeCodeModels.setReasoningEffort(update.value as ClaudeCodeReasoningLevel);
 			} else if (update.optionId === FOLDER_OPTION_ID && typeof update.value === 'string') {
 				this._sessionFolders.set(sessionId, URI.file(update.value));
 			}
@@ -426,6 +458,7 @@ export class ClaudeChatSessionContentProvider extends Disposable implements vsco
 		const options: Record<string, string | vscode.ChatSessionProviderOptionItem> = {};
 		options[MODELS_OPTION_ID] = model;
 		options[PERMISSION_MODE_OPTION_ID] = permissionMode;
+		options[REASONING_EFFORT_OPTION_ID] = this.claudeCodeModels.getReasoningEffort();
 
 		// Include folder option if applicable (multi-root or empty workspace)
 		const workspaceFolders = this.workspaceService.getWorkspaceFolders();

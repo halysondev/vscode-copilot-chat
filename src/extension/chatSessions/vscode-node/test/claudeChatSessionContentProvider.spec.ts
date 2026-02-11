@@ -100,6 +100,14 @@ function createDefaultMocks() {
 			{ id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' },
 			{ id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku' }
 		]),
+		getReasoningEffort: vi.fn().mockReturnValue('high'),
+		setReasoningEffort: vi.fn().mockResolvedValue(undefined),
+		getReasoningEffortOptions: vi.fn().mockReturnValue([
+			{ id: 'disable', name: 'Disable', description: 'No thinking' },
+			{ id: 'low', name: 'Low', description: '2,048 tokens' },
+			{ id: 'medium', name: 'Medium', description: '8,192 tokens' },
+			{ id: 'high', name: 'High', description: '16,384 tokens' },
+		]),
 		mapSdkModelToEndpointModel: vi.fn().mockResolvedValue(undefined)
 	} as any;
 
@@ -207,6 +215,16 @@ describe('ChatSessionContentProvider', () => {
 
 			expect(result.history).toEqual([]);
 			expect(mockSessionService.getSession).toHaveBeenCalledWith(sessionUri, CancellationToken.None);
+		});
+
+		it('includes reasoning effort option in session content', async () => {
+			vi.mocked(mockSessionService.getSession).mockResolvedValue(undefined);
+			vi.mocked(mockClaudeCodeModels.getReasoningEffort).mockReturnValue('medium');
+
+			const sessionUri = createClaudeSessionUri('test-session');
+			const result = await provider.provideChatSessionContent(sessionUri, CancellationToken.None);
+
+			expect(result.options?.['reasoningEffort']).toBe('medium');
 		});
 	});
 
@@ -452,6 +470,50 @@ describe('ChatSessionContentProvider', () => {
 			const result = await provider.provideChatSessionContent(sessionUri, CancellationToken.None);
 
 			expect(result.options?.['model']).toBe(UNAVAILABLE_MODEL_ID);
+		});
+	});
+
+	// #endregion
+
+	// #region Reasoning Effort
+
+	describe('reasoning effort options', () => {
+		it('includes thinking option group in provider options', async () => {
+			const options = await provider.provideChatSessionProviderOptions();
+			const thinkingGroup = options.optionGroups?.find(g => g.id === 'reasoningEffort');
+
+			expect(thinkingGroup).toBeDefined();
+			expect(thinkingGroup?.name).toBe('Thinking');
+			expect(thinkingGroup?.items.map(i => i.id)).toEqual(['disable', 'low', 'medium', 'high']);
+		});
+
+		it('persists selected reasoning effort when option changes', async () => {
+			const sessionUri = createClaudeSessionUri('test-session');
+
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'reasoningEffort', value: 'low' }],
+				CancellationToken.None
+			);
+
+			expect(mockClaudeCodeModels.setReasoningEffort).toHaveBeenCalledWith('low');
+		});
+
+		it('falls back max reasoning effort to high when selected model is not Opus 4.6', async () => {
+			vi.mocked(mockClaudeCodeModels.getReasoningEffort).mockReturnValue('max');
+			const providerOptionsChangedSpy = vi.fn();
+			const disposable = provider.onDidChangeChatSessionProviderOptions(providerOptionsChangedSpy);
+
+			const sessionUri = createClaudeSessionUri('test-session');
+			await provider.provideHandleOptionsChange(
+				sessionUri,
+				[{ optionId: 'model', value: 'claude-sonnet-4-5' }],
+				CancellationToken.None
+			);
+
+			expect(mockClaudeCodeModels.setReasoningEffort).toHaveBeenCalledWith('high');
+			expect(providerOptionsChangedSpy).toHaveBeenCalledTimes(1);
+			disposable.dispose();
 		});
 	});
 
