@@ -24,8 +24,16 @@ export const CLAUDE_CODE_OAUTH_CONFIG = {
 // Token storage key
 const CLAUDE_CODE_CREDENTIALS_KEY = "claude-code-oauth-credentials";
 
+export type ClaudeCodeCredentials = {
+	type: "claude";
+	access_token: string;
+	refresh_token: string;
+	expired: string; // RFC3339 datetime
+	email?: string;
+};
+
 // Credentials schema
-const claudeCodeCredentialsSchema = z.object({
+const claudeCodeCredentialsSchema: z.ZodType<ClaudeCodeCredentials> = z.object({
 	type: z.literal("claude"),
 	access_token: z.string().min(1),
 	refresh_token: z.string().min(1),
@@ -33,10 +41,18 @@ const claudeCodeCredentialsSchema = z.object({
 	email: z.string().optional(),
 });
 
-export type ClaudeCodeCredentials = z.infer<typeof claudeCodeCredentialsSchema>
+type TokenResponse = {
+	access_token: string;
+	// Refresh responses may omit refresh_token (common OAuth behavior). When omitted,
+	// callers must preserve the existing refresh token.
+	refresh_token?: string;
+	expires_in: number;
+	email?: string;
+	token_type?: string;
+};
 
 // Token response schema from Anthropic
-const tokenResponseSchema = z.object({
+const tokenResponseSchema: z.ZodType<TokenResponse> = z.object({
 	access_token: z.string(),
 	// Refresh responses may omit refresh_token (common OAuth behavior). When omitted,
 	// callers must preserve the existing refresh token.
