@@ -45,3 +45,4 @@ settings.local.json
 *.vsix
 nul
 Roo-Code/
+*.visx

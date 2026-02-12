@@ -113,7 +113,8 @@ export class ClaudeLanguageModelServer extends Disposable {
 	private async handleMessagesRequest(req: http.IncomingMessage, res: http.ServerResponse) {
 		try {
 			const body = await this.readRequestBody(req);
-			if (!(await this.isAuthTokenValid(req))) {
+			const auth = extractSessionId(req.headers, this.config.nonce);
+			if (!auth.valid) {
 				this.error('Invalid auth key');
 				this.sendErrorResponse(res, 401, 'authentication_error', 'Invalid authentication');
 				return;
@@ -131,26 +132,6 @@ export class ClaudeLanguageModelServer extends Disposable {
 			}
 		}
 		return;
-	}
-
-	/**
-	 * Verify nonce from x-api-key or Authorization header
-	 */
-	private async isAuthTokenValid(req: http.IncomingMessage): Promise<boolean> {
-		// Check x-api-key header (used by SDK)
-		const apiKeyHeader = req.headers['x-api-key'];
-		if (apiKeyHeader === this.config.nonce) {
-			return true;
-		}
-
-		// Check Authorization header with Bearer prefix (used by CLI with ANTHROPIC_AUTH_TOKEN)
-		const authHeader = req.headers['authorization'];
-		if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-			const token = authHeader.slice(7); // Remove "Bearer " prefix
-			return token === this.config.nonce;
-		}
-
-		return false;
 	}
 
 	private async readRequestBody(req: http.IncomingMessage): Promise<string> {
@@ -738,6 +719,54 @@ export class ClaudeLanguageModelServer extends Disposable {
 		const messageWithClassName = `[ClaudeLanguageModelServer] ${message}`;
 		this.logService.trace(messageWithClassName);
 	}
+}
+
+export interface ExtractSessionIdResult {
+	/** Whether the auth nonce is valid. */
+	readonly valid: boolean;
+	/** The session ID, if present in the `nonce.sessionId` format. `undefined` for legacy (nonce-only) format. */
+	readonly sessionId: string | undefined;
+}
+
+/**
+ * Extracts and validates the session ID from HTTP request headers.
+ * The API key format is `nonce.sessionId` where the nonce is used for auth
+ * and the sessionId identifies which Claude session is making the request.
+ *
+ * Checks `x-api-key` header first (used by SDK), then `Authorization: Bearer` (used by CLI).
+ */
+export function extractSessionId(headers: http.IncomingHttpHeaders, expectedNonce: string): ExtractSessionIdResult {
+	let apiKey: string | undefined;
+
+	// Check x-api-key header (used by SDK)
+	const apiKeyHeader = headers['x-api-key'];
+	if (typeof apiKeyHeader === 'string') {
+		apiKey = apiKeyHeader;
+	}
+
+	// Check Authorization header with Bearer prefix (used by CLI with ANTHROPIC_AUTH_TOKEN)
+	if (!apiKey) {
+		const authHeader = headers['authorization'];
+		if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+			apiKey = authHeader.slice(7); // Remove "Bearer " prefix
+		}
+	}
+
+	if (!apiKey) {
+		return { valid: false, sessionId: undefined };
+	}
+
+	// Parse `nonce.sessionId` format
+	const dotIndex = apiKey.indexOf('.');
+	if (dotIndex === -1) {
+		// Legacy format without session ID — validate nonce only
+		return { valid: apiKey === expectedNonce, sessionId: undefined };
+	}
+
+	const nonce = apiKey.slice(0, dotIndex);
+	const sessionId = apiKey.slice(dotIndex + 1);
+	const valid = nonce === expectedNonce;
+	return { valid, sessionId: valid ? sessionId : undefined };
 }
 
 /**
